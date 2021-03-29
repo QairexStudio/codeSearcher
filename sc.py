@@ -1,5 +1,4 @@
 import sys
-import argparse
 import os
 import searcher as search
 import parser

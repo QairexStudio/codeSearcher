@@ -1,7 +1,5 @@
 import os
 import sys
-## python3 sc.py -u -s // error
-## int(c) and int(p) and str(s) and str(r)
 class Parse:
     def __init__(self, com):
         self.command = com
