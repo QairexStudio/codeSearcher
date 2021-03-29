@@ -1,0 +1,5331 @@
+--------------------------------------https://searchcode.com/codesearch/view/106864300/--------------------------------------
+<?php
+
+require_once __DIR__ . '/compatibility.php';
+require_once __DIR__ . '/exceptions.php';
+
+require_once __DIR__ . '/IMapper.php';
+require_once __DIR__ . '/IValidator.php';
+
+require_once __DIR__ . '/LazyArrayList.php';
+require_once __DIR__ . '/Mapper.php';
+require_once __DIR__ . '/Storage.php';
+require_once __DIR__ . '/Validator.php';
+require_once __DIR__ . '/Inflector.php';
+require_once __DIR__ . '/Record.php';
+
+require_once __DIR__ . '/RecordHelper.php';
+require_once __DIR__ . '/TableHelper.php';
+require_once __DIR__ . '/ActiveCollection.php';
+require_once __DIR__ . '/ActiveMapper.php';
+require_once __DIR__ . '/AssociatedCollection.php';
+
+require_once __DIR__ . '/Annotations/AssociationAnnotation.php';
+require_once __DIR__ . '/Annotations/BelongsToAnnotation.php';
+require_once __DIR__ . '/Annotations/HasAndBelongsToManyAnnotation.php';
+require_once __DIR__ . '/Annotations/HasManyAnnotation.php';
+require_once __DIR__ . '/Annotations/HasOneAnnotation.php';
+
+require_once __DIR__ . '/Associations/Association.php';
+require_once __DIR__ . '/Associations/BelongsToAssociation.php';
+require_once __DIR__ . '/Associations/HasAndBelongsToManyAssociation.php';
+require_once __DIR__ . '/Associations/HasManyAssociation.php';
+require_once __DIR__ . '/Associations/HasOneAssociation.php';
+
+
+/**
+ * @author     Roman Sklenář
+ * @copyright  Copyright (c) 2009 Roman Sklenář (http://romansklenar.cz)
+ * @license    New BSD License
+ * @example    http://wiki.github.com/romansklenar/dibi-activerecord
+ */
+abstract class ActiveRecord extends Record {
+
+	/** @var string  table name, if not set uses Inflector::tableize() to detect table name */
+	protected static $table;
+
+	/** @var string|array  primary key name, if not set uses DibiTableInfo::getPrimaryKey() to detect primary key(s) */
+	protected static $primary;
+
+	/** @var string  foreign key mask, if not set uses Inflector::foreignKey() to detect foreign key names */
+	protected static $foreing; // i.e. '%table%Id', '%table%_id', '%table%_%primary%', '%primary%'
+
+	/** @var string  used connection name */
+	protected static $connection = Mapper::DEFAULT_CONNECTION;
+
+	/** @var string  used mapper class */
+	protected static $mapper = self::DEFAULT_MAPPER;
+
+	/** @var array  detected primary key name and table name cache */
+	private static $register = array();
+
+	/** @var IValidator */
+	protected static $validator;
+
+	/** @var Storage  internal data storage */
+	private $values;
+
+	/** @var Storage  internal dirty data storage */
+	private $dirty;
+
+	/** @var bool  record state sign */
+	private $state;
+
+	/**#@+ Configuration options */
+	const DEFAULT_MAPPER = 'ActiveMapper';
+	/**#@-*/
+
+	/**#@+ state */
+	const STATE_INITIALISING = '%I';
+	const STATE_EXISTING = '%E';
+	const STATE_NEW = '%N';
+	const STATE_DELETED = '%D';
+	/**#@-*/
+
+
+	/**
+	 * Object constructor.
+	 *
+	 * @param ArrayObject|array $input
+	 * @param int $state  does data physically exists in database?
+	 */
+	public function __construct($input = array(), $state = NULL) {
+		if (!is_array($input) && !$input instanceof ArrayObject)
+			throw new InvalidArgumentException("Provided input is not array or ArrayObject, '" . gettype($input) . "' given.");
+
+		if ($state === NULL)
+			$state = $this->detectState((array) $input);
+
+		if ($state !== self::STATE_NEW && $state !== self::STATE_EXISTING)
+			throw new InvalidArgumentException("Unknow record state '$state' given.");
+
+		$this->state = $state;
+		$this->values = new Storage;
+		$this->dirty = new Storage;
+
+		$values = (array) $input + self::getDefaults();
+		$this->setValues($values);
+
+		$this->values = $this->dirty;
+		if ($this->isExistingRecord())
+			$this->dirty = new Storage;
+	}
+
+
+	/**
+	 * Object destructor.
+	 */
+	public function  __destruct() {
+		// TODO: rollback all incomplete transactions
+	}
+
+
+
+	/********************* state stuff *********************/
+
+
+
+	/**
+	 * Try to detects state of this object.
+	 *
+	 * @param array $input
+	 * @return int
+	 */
+	private function detectState(array $input) {
+		$state = count(self::getColumnNames()) !== count($input) || count($input) == 0 ? self::STATE_NEW : self::STATE_EXISTING;
+
+		if ($state == self::STATE_EXISTING) {
+			$primary = is_array(self::getPrimaryKey()) ? self::getPrimaryKey() : array(self::getPrimaryKey());
+			foreach ($primary as $key) {
+				if (isset($input[$key])) {
+					if ($input[$key] === NULL)
+						return self::STATE_NEW;
+				} else {
+					return self::STATE_NEW;
+				}
+			}
+		}
+
+		if ($state !== self::STATE_NEW && $state !== self::STATE_EXISTING)
+			throw new InvalidArgumentException("Unable to detect record state.");
+
+		return $state;
+	}
+
+
+	/**
+	 * Returns true if this object has been saved yet — that is, a record for the object exists in repository.
+	 *
+	 * @return bool
+	 */
+	public function isExistingRecord() {
+		return $this->state === self::STATE_EXISTING;
+	}
+
+
+	/**
+	 * Returns true if this object hasn't been saved yet — that is, a record for the object doesn't exist yet.
+	 *
+	 * @return bool
+	 */
+	public function isNewRecord() {
+		return $this->state === self::STATE_NEW;
+	}
+
+
+	/**
+	 * Returns true if this object has been deleted yet — that is, a record for the object was deleted from repository.
+	 *
+	 * @return bool
+	 */
+	public function isDeletedRecord() {
+		return $this->state === self::STATE_DELETED;
+	}
+
+
+
+	/********************* connection stuff *********************/
+
+
+
+	/**
+	 * Returns the connection associated with the class.
+	 *
+	 * @return DibiConnection
+	 */
+	public static function getConnection() {
+		return ActiveMapper::getConnection(self::getConnectionName());
+	}
+
+
+	/**
+	 * Returns the connection name associated with the class.
+	 *
+	 * @return string
+	 */
+	private static function getConnectionName() {
+		return static::$connection;
+	}
+
+
+	/**
+	 * Returns the mapper class name associated with the class.
+	 *
+	 * @return string
+	 */
+	private static function getMapper() {
+		return static::$mapper;
+	}
+
+
+	/**
+	 * Returns the data source object associated with the class.
+	 *
+	 * @return DibiDataSource
+	 */
+	public static function getDataSource() {
+		return self::getConnection()->dataSource(self::getTableName());
+	}
+
+
+
+	/********************* database stuff *********************/
+
+
+
+	/**
+	 * Defines table name associated with this class — can be overridden in subclasses.
+	 *
+	 * @return string
+	 */
+	public static function getTableName() {
+		if (isset(static::$table) && !empty(static::$table)) {
+			return static::$table;
+
+		} else {
+			$class = self::getClass();
+			if (!isset(self::$register[$class]['table']))
+				self::$register[$class]['table'] = Inflector::tableize($class);
+			return self::$register[$class]['table'];
+		}
+	}
+
+
+	/**
+	 * Returns the table reflection object associated with the class.
+	 *
+	 * @return DibiTableInfo
+	 */
+	public static function getTableInfo() {
+		$class = self::getClass();
+		if (!isset(self::$register[$class]['tableInfo']))
+			self::$register[$class]['tableInfo'] = TableHelper::getTableInfo($class);
+		return self::$register[$class]['tableInfo'];
+	}
+
+
+	/**
+	 * Indicates whether the table associated with this class exists.
+	 *
+	 * @return bool
+	 */
+	public static function tableExists() {
+		return self::getConnection()->getDatabaseInfo()->hasTable(self::getTableName());
+	}
+
+
+	/**
+	 * Defines the primary key field — can be overridden in subclasses.
+	 *
+	 * @return string|array
+	 */
+	public static function getPrimaryKey() {
+		if (isset(static::$primary) && !empty(static::$primary)) {
+			return static::$primary;
+
+		} else {
+			$class = self::getClass();
+			if (!isset(self::$register[$class]['primary']))
+				self::$register[$class]['primary'] = TableHelper::getPrimaryKey(TableHelper::getPrimaryInfo($class));
+			return self::$register[$class]['primary'];
+		}
+	}
+
+
+	/**
+	 * Returns the primary key index reflection object associated with the class.
+	 *
+	 * @return DibiIndexInfo
+	 */
+	public static function getPrimaryInfo() {
+		$class = self::getClass();
+		if (!isset(self::$register[$class]['primaryInfo'])) {
+			if (isset(static::$primary) && !empty(static::$primary)) {
+				$info = self::generatePrimaryInfo();
+			} else {
+				$info = TableHelper::getPrimaryInfo(self::getClass());
+			}
+			self::$register[$class]['primaryInfo'] = $info;
+		}
+		return self::$register[$class]['primaryInfo'];
+	}
+
+
+	/**
+	 * Generates virtual primary key index reflection object.
+	 * Hook for database which do not support index reflection in specific DibiDriver.
+	 *
+	 * @return DibiIndexInfo
+	 */
+	private static function generatePrimaryInfo() {
+		$primary = self::getPrimaryKey();
+		$info = array(
+			'name' => self::getTableName() . '_primary',
+			'columns' => is_array($primary) ? $primary : array($primary),
+			'unique' => FALSE,
+			'primary' => TRUE,
+		);
+
+		foreach ($info['columns'] as $key => $name) {
+			$info['columns'][$key] = self::getTableInfo()->getColumn($name);
+			if ($info['columns'][$key]->isAutoIncrement())
+				$info['unique'] = TRUE;
+		}
+		return new DibiIndexInfo($info);
+	}
+
+
+	/**
+	 * Defines the foreign key field name — can be overridden in subclasses.
+	 *
+	 * @return string
+	 */
+	public static function getForeignKey() {
+		if (isset(static::$foreing) && !empty(static::$foreing)) {
+			return str_replace(
+				array('%table%', '%primary%'),
+				array(self::getTableName(), self::getPrimaryKey()),
+				static::$foreing
+			);
+
+		} else {
+			$class = self::getClass();
+			if (!isset(self::$register[$class]['foreign']))
+				self::$register[$class]['foreign'] = Inflector::foreignKey($class);
+			return self::$register[$class]['foreign'];
+		}
+	}
+
+
+	/**
+	 * Returns an array of column reflection objects for the table associated with this class.
+	 *
+	 * @return array
+	 */
+	public static function getColumns() {
+		return self::getTableInfo()->getColumns();
+	}
+
+
+	/**
+	 * Does table associated with this class has given column?
+	 *
+	 * @param string $name
+	 * @return array
+	 */
+	public function hasColumn($name) {
+		return self::getTableInfo()->hasColumn($name);
+	}
+
+
+	/**
+	 * Returns an array of column names as strings.
+	 *
+	 * @return array
+	 */
+	public static function getColumnNames() {
+		$class = self::getClass();
+		if (!isset(self::$register[$class]['columnNames']))
+			self::$register[$class]['columnNames'] = TableHelper::getColumnNames($class);
+		return self::$register[$class]['columnNames'];
+	}
+
+
+
+	/********************* association handling *********************/
+
+
+
+	/**
+	 * Returns an array of association objects for the associations of with this class.
+	 *
+	 * @param string|array $filter
+	 * @return array
+	 */
+	public static function getAssociations($filter = NULL) {
+		$class = self::getClass();
+		if (!isset(self::$register[$class]['associations']))
+			self::$register[$class]['associations'] = RecordHelper::getAssociations($class);
+		$asc = self::$register[$class]['associations'];
+		
+		if ($filter === NULL)
+			return $asc;
+
+		if (is_string($filter))
+			$filter = array($filter);
+
+		$arr = array();
+		foreach ($asc as $name => $association)
+			if (in_array($association->getType(), $filter))
+				$arr[] = $association;
+		return $arr;
+	}
+
+
+	/**
+	 * Does specified class or attribute has association to this class?
+	 *
+	 * @param string $name  name of called attribute / related class name
+	 * @return bool|Association
+	 */
+	public function hasAssociation($name) {
+		$asc = self::getAssociations();
+		$exists = array_key_exists($name, $asc);
+		if ($exists || $this->state === self::STATE_INITIALISING)
+			return $exists;
+
+		foreach ($asc as $association)
+			if ($association->isInRelation(Inflector::classify($name)))
+				return TRUE;
+		return FALSE;
+	}
+
+
+	/**
+	 * Returns association object to specified class.
+	 *
+	 * @param string $name  name of called attribute / related class name
+	 * @return Association
+	 */
+	public function getAssociation($name) {
+		$asc = self::getAssociations();
+		if ($this->hasAssociation($name)) {
+			if (array_key_exists($name, $asc)) {
+				return $asc[$name];
+			} else {
+				foreach ($asc as $association)
+					if ($association->isInRelation(Inflector::classify($name)))
+						return $association;
+			}
+		} else {
+			throw new ActiveRecordException("Asscociation to '" . Inflector::classify($name) . "' not founded.");
+		}
+	}
+
+
+
+	/********************* attributes handling *********************/
+
+
+
+	/**
+	 * Returns an array of names for the attributes available on this object.
+	 *
+	 * @return array
+	 */
+	public static function getAttributes() {
+		return array_merge(self::getColumnNames(), array_keys(self::getAssociations()));
+	}
+
+
+	/**
+	 * Is the specified attribute defined on this object?
+	 *
+	 * @param string $name
+	 * @return bool
+	 */
+	public static function hasAttribute($name) {
+		return in_array($name, self::getAttributes());
+	}
+
+
+	/**
+	 * Returns value of specified attribute.
+	 *
+	 * @param  string $name  attribute name
+	 * @throws MemberAccessException if the attribute is not defined.
+	 */
+	protected function getAttribute($name) {
+		if ($this->hasAssociation($name)) {
+			if (array_key_exists($name, $this->dirty))
+				return $this->dirty->$name;
+			else if (array_key_exists($name, $this->values))
+				return $this->values->$name;
+			else // lazy load
+				return $this->values->$name = $this->getAssociation($name)->retreiveReferenced($this);
+
+		} else if ($this->hasColumn($name)) {
+			if (array_key_exists($name, $this->dirty))
+				$value = $this->dirty->$name;
+			else if (array_key_exists($name, $this->values))
+				$value = $this->values->$name;
+			else // not inicialized yet
+				return NULL;
+			return $this->typeCast($name, $value);
+
+		} else {
+			throw MemberAccessException("Unknown record attribute $this->class::\$$name.");
+		}
+	}
+
+
+	/**
+	 * Assigns value to specified attribute.
+	 *
+	 * @param  string $name    attribute name
+	 * @param  mixed  $value   attribute value
+	 * @return void
+	 * @throws MemberAccessException if the attribute is not defined or is read-only
+	 */
+	protected function setAttribute($name, $value) {
+		if ($this->hasAssociation($name)) {
+			$current = $this->getAttribute($name);
+			$asc = $this->getAssociation($name);
+			if ($asc->typeCheck($value)) {
+				$this->dirty->$name = $asc->saveReferenced($this, $value);
+			} else {
+				$many = $asc->type == Association::HAS_MANY || $asc->type == Association::HAS_AND_BELONGS_TO_MANY;
+				$type = $many ? "collection of $asc->referenced objects" : "object of $asc->referenced";
+				$class = get_class($value);
+				throw new InvalidArgumentException("Cannot assign object of $class, $type expected.");
+			}
+
+		} else if ($this->hasColumn($name)) {
+			$current = $this->getAttribute($name);
+			if ($current != $value)
+				$this->dirty->$name = $this->typeCast($name, $value);
+
+		} else {
+			throw MemberAccessException("Unknown record attribute $this->class::\$$name.");
+		}
+	}
+
+
+	/**
+	 * Provides type casting of this class attributes.
+	 *
+	 * @param  string $name    attribute name
+	 * @param  mixed  $value   attribute value
+	 * @return void
+	 */
+	private function typeCast($name, $value) {
+		if ($value === NULL || $value instanceof ActiveRecord || $value instanceof ActiveCollection)
+			return $value;
+
+		switch ($this->types[$name]) {
+			case dibi::TEXT: $value = (string) $value; break;
+			case dibi::BOOL: $value = ((bool) $value) && $value !== 'f' && $value !== 'F'; break;
+			case dibi::INTEGER: $value = (int) $value; break;
+			case dibi::FLOAT: $value = (float) $value; break;
+			case dibi::DATE:
+			case dibi::TIME:
+			case dibi::DATETIME:
+				if ($value instanceof DateTime)
+					return $value;
+				else if ((int) $value === 0) // '', NULL, FALSE, '0000-00-00', ...
+					return NULL;
+				else
+					$value = new DateTime(is_numeric($value) ? date('Y-m-d H:i:s', $value) : $value);
+				break;
+
+			case dibi::BINARY:
+			default: break;
+		}
+		return $value;
+	}
+
+
+
+	/********************* values stuff *********************/
+
+
+
+	/**
+	 * Returns a hash of data types of this object associated table columns (column => type).
+	 *
+	 * @return array
+	 */
+	public static function getTypes() {
+		$class = self::getClass();
+		if (!isset(self::$register[$class]['types']))
+			self::$register[$class]['types'] = TableHelper::getColumnTypes($class);
+		return self::$register[$class]['types'];
+	}
+
+
+	/**
+	 * Returns a hash of this object associated table columns values (column => value).
+	 *
+	 * @return array
+	 */
+	public function getValues() {
+		return RecordHelper::getValues($this, self::getColumnNames());
+	}
+
+
+	/**
+	 * Assigns values of this object associated table columns values.
+	 *
+	 * @param array $input  values in array(column => value)
+	 * @return void
+	 */
+	public function setValues(array $input) {
+		RecordHelper::setValues($this, $input);
+	}
+
+
+	/**
+	 * Returns a hash of all columns default values (column => default value)
+	 *
+	 * @return array
+	 */
+	private static function getDefaults() {
+		$class = self::getClass();
+		if (!isset(self::$register[$class]['defaults']))
+			self::$register[$class]['defaults'] = TableHelper::getColumnDefaults($class);
+		return self::$register[$class]['defaults'];
+	}
+
+
+	/**
+	 * Returns a hash of all changed attributes (attr => new value)
+	 *
+	 * @return array
+	 */
+	public function getChanges() {
+		$dirty = array();
+		foreach ($this->originals as $attr => $orig)
+			if ($orig instanceof ActiveRecord || $orig instanceof ActiveCollection)
+				if ($orig->isDirty())
+					$dirty[$attr] = $orig;
+		return new Storage(array_merge((array) $this->dirty, $dirty));
+	}
+
+
+	/**
+	 * Returns a hash of all original attributes (attr => original value)
+	 *
+	 * @return array
+	 */
+	public function getOriginals() {
+		return clone $this->values;
+	}
+
+
+	/**
+	 * Returns value of specified attribute.
+	 *
+	 * @param string $attr
+	 * @return array
+	 */
+	public function getChange($attr) {
+		return $this->getChanges()->$attr;
+	}
+
+
+	/**
+	 * Returns original value of specified attribute.
+	 *
+	 * @param string $attr
+	 * @return array
+	 */
+	public function getOriginal($attr) {
+		return $this->getOriginals()->$attr;
+	}
+
+
+
+	/********************* events *********************/
+
+
+
+	/**
+	 * Calls public method if exists.
+	 * @param  string
+	 * @param  array
+	 * @return bool  does method exist?
+	 */
+	private function tryCall($method, array $params) {
+		$rc = self::getReflection();
+		if ($rc->hasMethod($method)) {
+			$rm = $rc->getMethod($method);
+			if ($rm->isPublic() && !$rm->isAbstract() && $rm->isStatic()) {
+				$rm->invokeNamedArgs($this, $params);
+				return TRUE;
+			}
+		}
+		return FALSE;
+	}
+
+
+
+	/********************* validation *********************/
+
+
+
+	/**
+	 * Returns validator object associated to this class.
+	 *
+	 * @return Validator
+	 */
+	protected function getValidator() {
+		if (static::$validator === NULL)
+			static::$validator = new Validator;
+
+		return static::$validator;
+	}
+
+
+	/**
+	 * Provides this object attributes validation.
+	 *
+	 * @return void
+	 */
+	public function validate() {
+		$this->tryCall('beforeValidation', array('sender' => $this));
+		// $this->getValidator()->validate($this);
+		$this->tryCall('afterValidation', array('sender' => $this));
+	}
+
+
+	/**
+	 * Is all attributes of this object valid?
+	 *
+	 * @return bool
+	 */
+	public function isValid() {
+		try {
+			$this->validate();
+			return TRUE;
+
+		} catch (ValidationException $e) {
+			return FALSE;
+		}
+	}
+
+
+
+	/********************* executors *********************/
+
+
+
+	/**
+	 * Checks if this object has unsaved changes.
+	 *
+	 * @return bool
+	 */
+	public function isDirty($attr = NULL) {
+		if ($attr == NULL)
+			return (bool) count($this->getChanges()) || $this->isNewRecord();
+
+		$attrs = is_array($attr) ? $attr : array($attr);
+		$changes = array_keys((array) $this->getChanges());
+		foreach ($attrs as $attr)
+			if (in_array($attr, $changes))
+				return TRUE;
+		return FALSE;
+	}
+
+
+	/**
+	 * Discards unsaved changes of this object to a similar state as was initialized (thus making all properties non dirty).
+	 *
+	 * @return void
+	 */
+	public function discard() {
+		$this->updating();
+		$this->dirty = $this->isNewRecord() ? $this->values : new Storage;
+		foreach ($this->getChanges() as $unsaved)
+			if ($unsaved->isDirty())
+				$unsaved->discard();
+	}
+
+
+	/**
+	 * Save the instance and loaded, dirty associations to the repository.
+	 *
+	 * @return ActiveRecord
+	 */
+	public function save() {
+		if ($this->isValid() && $this->isDirty()) {
+			try {
+				$this->updating();
+				$this->tryCall('beforeSave', array('sender' => $this));
+
+				foreach ($this->getChanges() as $attr => $unsaved)
+					if ($unsaved instanceof ActiveRecord || $unsaved instanceof ActiveCollection)
+						$unsaved->save();
+
+				if ($this->isDirty(self::getColumnNames())) {
+					$mapper = self::getMapper();
+					$mapper::save($this);
+				}
+				$this->values = new Storage($this->getValues());
+				$this->dirty = new Storage;
+				$this->state = self::STATE_EXISTING;
+				$this->tryCall('afterSave', array('sender' => $this));
+
+			} catch (DibiException $e) {
+				throw new ActiveRecordException("Unable to save record.", 500, $e);
+			}
+		}
+	}
+
+
+	/**
+	 * Deletes the record in the database and freezes this instance to reflect
+	 * that no changes should be made (since they can‘t be persisted).
+	 *
+	 * @return bool  true if the record was destroyed
+	 */
+	public function destroy() {
+		try {
+			$this->updating();
+			$this->tryCall('beforeDestroy', array('sender' => $this));
+
+			$mapper = self::getMapper();
+			$deleted = (bool) $mapper::delete($this);
+
+			$this->dirty = new Storage;
+			foreach ($this->values as & $v)
+				$v = NULL;
+			$this->state = self::STATE_DELETED;
+
+			$this->tryCall('afterDestroy', array('sender' => $this));
+			$this->freeze();
+			return $deleted;
+
+		} catch (DibiException $e) {
+				throw new ActiveRecordException("Unable to destroy record.", 500, $e);
+		}
+	}
+
+
+	/**
+	 * Creates, saves and returns new record.
+	 *
+	 * @param array|ArrayObject $input
+	 * @return ActiveRecord
+	 */
+	public static function create($input = array()) {
+		$record = new static($input, self::STATE_NEW);
+		$record->save();
+		return $record;
+	}
+
+
+
+	/********************* counting *********************/
+
+
+
+	/**
+	 * Returns number of objects satisfactoring input conditions.
+	 *
+	 * @param array $where
+	 * @param array $limit
+	 * @param array $offset
+	 * @return int
+	 */
+	public static function count($where = array(), $limit = NULL, $offset = NULL) {
+		if (!is_array($where) && (is_numeric($where) || (is_string($where) && str_word_count($where) == 1)))
+			$where = array(RecordHelper::formatArguments(self::getPrimaryInfo(), func_get_args())); // intentionally not getPrimaryInfo() from helper
+
+		$mapper = self::getMapper();
+		return $mapper::find(self::getClass(), array('where' => $where, 'limit' => $limit, 'offset' => $offset), IMapper::ALL)->count();
+	}
+
+
+	/**
+	 * Returns avarage value of specified column of objects stored in repository.
+	 *
+	 * @param string $column
+	 * @return float|int
+	 */
+	public static function avarage($column) {
+		return self::getConnection()->query('SELECT AVG(%n) FROM (%sql)', $column, (string) self::getDataSource())->fetchSingle();
+	}
+
+
+	/**
+	 * Returns minimum value of specified column of objects stored in repository.
+	 *
+	 * @param string $column
+	 * @return float|int
+	 */
+	public static function minimum($column) {
+		return self::getConnection()->query('SELECT MIN(%n) FROM (%sql)', $column, (string) self::getDataSource())->fetchSingle();
+	}
+
+
+	/**
+	 * Returns maximum value of specified column of objects stored in repository.
+	 *
+	 * @param string $column
+	 * @return float|int
+	 */
+	public static function maximum($column) {
+		return self::getConnection()->query('SELECT MAX(%n) FROM (%sql)', $column, (string) self::getDataSource())->fetchSingle();
+	}
+
+
+	/**
+	 * Returns sum of specified column of objects stored in repository.
+	 *
+	 * @param string $column
+	 * @return float|int
+	 */
+	public static function sum($column) {
+		return self::getConnection()->query('SELECT SUM(%n) FROM (%sql)', $column, (string) self::getDataSource())->fetchSingle();
+	}
+
+
+
+	/********************* finders *********************/
+
+
+
+	/**
+	 * Django-like alias to find().
+	 *
+	 * @return ActiveCollection
+	 */
+	public static function objects() {
+		return self::findAll();
+	}
+
+
+	/**
+	 * Static finder.
+	 *
+	 * @param array $where
+	 * @param array $order
+	 * @return ActiveRecord|ActiveCollection|NULL
+	 */
+	public static function find($where = array(), $order = array()) {
+		$mapper = self::getMapper();
+
+		if (!is_array($where) && (is_numeric($where) || (is_string($where) && str_word_count($where) == 1))) {
+			$params = func_get_args();
+			$where = RecordHelper::formatArguments(self::getPrimaryInfo(), $params); // intentionally not getPrimaryInfo() from helper
+			return $mapper::find(self::getClass(), array('where' => array($where)), count($params) == 1 ? IMapper::FIRST : IMapper::ALL);
+
+		} else {
+			return $mapper::find(self::getClass(), array('where' => $where, 'order' => $order), IMapper::FIRST);
+		}
+	}
+
+
+	/**
+	 * Static finder.
+	 *
+	 * @param array $where
+	 * @param array $order
+	 * @param array $limit
+	 * @param array $offset
+	 * @return ActiveCollection|NULL
+	 */
+	public static function findAll($where = array(), $order = array(), $limit = NULL, $offset = NULL) {
+		$mapper = self::getMapper();
+		$options = array('where' => $where, 'order' => $order, 'limit' => $limit, 'offset' => $offset);
+		return $mapper::find(self::getClass(), $options, IMapper::ALL);
+	}
+
+
+	/**
+	 * Internal finder.
+	 * 
+	 * @param array $where
+	 * @param string $scope
+	 * @return ActiveCollection|ActiveRecord|NULL
+	 */
+	private static function findBy($where = array(), $scope = IMapper::FIRST) {
+		foreach ($where as $key => $value)
+			if (is_array($value)) {
+				unset($where[$key]);
+				$where[] = array('%n IN %l', $key, $value);
+			}
+
+		$mapper = self::getMapper();
+		return $scope == IMapper::FIRST ? self::find($where) : self::findAll($where);
+	}
+
+
+	/**
+	 * Static Magic find.
+	 * - $col = Page::findAllByUrl('about-us');
+	 * - $rec = Page::findByCategoryIdAndVisibility(5, TRUE);
+	 * - $rec = User::findByNameAndLogin('John', 'john007');
+	 * - $rec = Product::findByCategory(3);
+	 *
+	 * @param string $name
+	 * @param array  $args
+	 * @return ActiveCollection|ActiveRecord|NULL
+	 */
+	public static function __callStatic($name, $args) {
+		if (strncmp($name, 'findBy', 6) === 0) { // single record
+			$method = 'find';
+			$name = substr($name, 6);
+
+		} elseif (strncmp($name, 'findAllBy', 9) === 0) { // record collection
+			$method = 'findAll';
+			$name = substr($name, 9);
+
+		} else {
+			return parent::__callStatic($name, $args);
+		}
+
+		// ProductIdAndTitle -> array('productId', 'title')
+		$parts = array_map('lcfirst', explode('And', $name));
+
+		if (count($parts) !== count($args)) {
+			throw new InvalidArgumentException("Magic find expects " . count($parts) . " parameters, but " . count($args) . " was given.");
+		}
+
+		return self::findBy(array_combine($parts, $args), $method == 'find' ? IMapper::FIRST : IMapper::ALL);
+	}
+
+
+
+	/**
+	 * Call to undefined method.
+	 *
+	 * @param  string  method name
+	 * @param  array   arguments
+	 * @return mixed
+	 * @throws MemberAccessException
+	 */
+	public function __call($name, $args) {
+		try {
+			return parent::__call($name, $args);
+
+		} catch (MemberAccessException $e) {
+			return self::__callStatic($name, $args);
+		}
+	}
+
+
+
+	/********************* magic getters & setters *********************/
+
+
+
+	/**
+	 * Returns property value. Do not call directly.
+	 *
+	 * @param  string  property name
+	 * @return mixed   property value
+	 * @throws MemberAccessException if the property is not defined.
+	 */
+	final public function &__get($name) {
+		try {
+			$value = /*Nette\*/ObjectMixin::get($this, $name);
+			return $value;
+
+		} catch(MemberAccessException $e) {
+			if (self::hasAttribute($name)) {
+				$value = $this->getAttribute($name);
+				return $value;
+
+			} else {
+				throw $e;
+			}
+		}
+	}
+
+
+	/**
+	 * Sets value of a property. Do not call directly.
+	 *
+	 * @param  string  property name
+	 * @param  mixed   property value
+	 * @return void
+	 * @throws MemberAccessException if the property is not defined or is read-only
+	 */
+	final public function __set($name, $value) {
+		$this->updating();
+
+		try {
+			/*Nette\*/ObjectMixin::set($this, $name, $value);
+
+		} catch(MemberAccessException $e) {
+			if (self::hasAttribute($name)) {
+				$this->setAttribute($name, $value);
+
+			} else {
+				throw $e;
+			}
+		}
+	}
+
+
+	/**
+	 * Is property defined?
+	 *
+	 * @param  string  property name
+	 * @return bool
+	 */
+	final public function __isset($name) {
+		return /*Nette\*/ObjectMixin::has($this, $name) ? TRUE : self::hasAttribute($name);
+	}
+
+
+	/**
+	 * Unset of property.
+	 *
+	 * @param  string  property name
+	 * @return void
+	 * @throws MemberAccessException
+	 */
+	final public function __unset($name) {
+		throw new NotSupportedException("Cannot unset the property $this->class::\$$name.");
+	}
+}
+
+--------------------------------------https://searchcode.com/codesearch/view/106903810/--------------------------------------
+<?php
+/**
+ * ezcConsoleToolsSuite
+ * 
+ * @package ConsoleTools
+ * @subpackage Tests
+ * @version //autogentag//
+ * @copyright Copyright (C) 2005-2010 eZ Systems AS. All rights reserved.
+ * @license http://ez.no/licenses/new_bsd New BSD License
+ */
+
+/**
+ * String too, used by several other classes in this component. 
+ */
+require_once 'string_tools_test.php';
+
+/**
+ * Require test suite for ezcConsoleOutput class.
+ */
+require_once 'output_test.php';
+/**
+ * Require test suite for ezcConsoleOutputFormat class.
+ */
+require_once 'output_format_test.php';
+/**
+ * Require test suite for ezcConsoleOutputFormats class.
+ */
+require_once 'output_formats_test.php';
+/**
+ * Require test suite for ezcConsoleOutputOptions class.
+ */
+require_once 'output_options_test.php';
+
+/**
+ * Require test suite for ezcConsoleInput class.
+ */
+require_once 'input_test.php';
+/**
+ * Require test suite for ezcConsoleOption class.
+ */
+require_once 'option_test.php';
+/**
+ * Require test suite for ezcConsoleOptionRule class.
+ */
+require_once 'option_rule_test.php';
+/**
+ * Require test suite for ezcConsoleArgument class. 
+ */
+require_once 'argument_test.php';
+/**
+ * Require test suite for ezcConsoleArguments class. 
+ */
+require_once 'arguments_test.php';
+
+/**
+ * Require test suite for ezcConsoleTable class.
+ */
+require_once 'table_test.php';
+/**
+ * Require test suite for ezcConsoleTableOptions class.
+ */
+require_once 'table_options_test.php';
+/**
+ * Require test suite for ezcConsoleTable class.
+ */
+require_once 'table_row_test.php';
+/**
+ * Require test suite for ezcConsoleTable class.
+ */
+require_once 'table_cell_test.php';
+
+/**
+ * Require test suite for ezcConsoleProgressbar class.
+ */
+require_once 'progressbar_test.php';
+/**
+ * Require test suite for ezcConsoleProgressbar class.
+ */
+require_once 'progressbar_options_test.php';
+
+/**
+ * Require test suite for ezcConsoleStatusbar class.
+ */
+require_once 'statusbar_test.php';
+/**
+ * Require test suite for ezcConsoleStatusbarOptions class.
+ */
+require_once 'statusbar_options_test.php';
+
+/**
+ * Require test suite for ezcConsoleProgressMonitor class.
+ */
+require_once 'progressmonitor_test.php';
+/**
+ * Require test suite for ezcConsoleProgressMonitor class.
+ */
+require_once 'progressmonitor_options_test.php';
+
+/**
+ * Require test suite for ezcConsoleDialogOptions class. 
+ */
+require_once 'dialog_options_test.php';
+/**
+ * Require test suite for ezcConsoleQuestionDialog class. 
+ */
+require_once 'question_dialog_test.php';
+/**
+ * Require test suite for ezcConsoleQuestionDialogOptions class. 
+ */
+require_once 'question_dialog_options_test.php';
+/**
+ * Require test suite for ezcConsoleQuestionDialogCollectionValidator class. 
+ */
+require_once 'question_dialog_mapping_validator_test.php';
+/**
+ * Require test suite for ezcConsoleQuestionDialogMappingValidator class. 
+ */
+require_once 'question_dialog_collection_validator_test.php';
+/**
+ * Require test suite for ezcConsoleQuestionDialogTypeValidator class. 
+ */
+require_once 'question_dialog_type_validator_test.php';
+/**
+ * Require test suite for ezcConsoleQuestionDialogRegexValidator class. 
+ */
+require_once 'question_dialog_regex_validator_test.php';
+/**
+ * Require test suite for ezcConsoleMenuDialog class. 
+ */
+require_once 'menu_dialog_test.php';
+/**
+ * Require test suite for ezcConsoleMenuDialogOptions class. 
+ */
+require_once 'menu_dialog_options_test.php';
+/**
+ * Require test suite for ezcConsoleMenuDialogDefaultValidator class. 
+ */
+require_once 'menu_dialog_default_validator_test.php';
+    
+/**
+ * Test suite for ConsoleTools package.
+ * 
+ * @package ConsoleTools
+ * @subpackage Tests
+ */
+class ezcConsoleToolsSuite extends PHPUnit_Framework_TestSuite
+{
+	public function __construct()
+	{
+		parent::__construct();
+        $this->setName( "ConsoleTools" );
+
+		$this->addTest( ezcConsoleStringToolsTest::suite() );
+        
+		$this->addTest( ezcConsoleOutputTest::suite() );
+		$this->addTest( ezcConsoleOutputFormatTest::suite() );
+		$this->addTest( ezcConsoleOutputFormatsTest::suite() );
+		$this->addTest( ezcConsoleOutputOptionsTest::suite() );
+
+		$this->addTest( ezcConsoleInputTest::suite() );
+		$this->addTest( ezcConsoleOptionTest::suite() );
+		$this->addTest( ezcConsoleOptionRuleTest::suite() );
+		$this->addTest( ezcConsoleArgumentTest::suite() );
+		$this->addTest( ezcConsoleArgumentsTest::suite() );
+
+		$this->addTest( ezcConsoleTableCellTest::suite() );
+		$this->addTest( ezcConsoleTableRowTest::suite() );
+		$this->addTest( ezcConsoleTableTest::suite() );
+		$this->addTest( ezcConsoleTableOptionsTest::suite() );
+
+		$this->addTest( ezcConsoleProgressbarTest::suite() );
+		$this->addTest( ezcConsoleProgressbarOptionsTest::suite() );
+
+		$this->addTest( ezcConsoleStatusbarTest::suite() );
+		$this->addTest( ezcConsoleStatusbarOptionsTest::suite() );
+
+		$this->addTest( ezcConsoleProgressMonitorTest::suite() );
+		$this->addTest( ezcConsoleProgressMonitorOptionsTest::suite() );
+
+		$this->addTest( ezcConsoleQuestionDialogTest::suite() );
+		$this->addTest( ezcConsoleDialogOptionsTest::suite() );
+		$this->addTest( ezcConsoleQuestionDialogOptionsTest::suite() );
+		$this->addTest( ezcConsoleQuestionDialogCollectionValidatorTest::suite() );
+		$this->addTest( ezcConsoleQuestionDialogMappingValidatorTest::suite() );
+		$this->addTest( ezcConsoleQuestionDialogTypeValidatorTest::suite() );
+		$this->addTest( ezcConsoleQuestionDialogRegexValidatorTest::suite() );
+		$this->addTest( ezcConsoleMenuDialogTest::suite() );
+		$this->addTest( ezcConsoleMenuDialogOptionsTest::suite() );
+		$this->addTest( ezcConsoleMenuDialogDefaultValidatorTest::suite() );
+	}
+
+    public static function suite()
+    {
+        return new ezcConsoleToolsSuite( "ezcConsoleToolsSuite" );
+    }
+}
+?>
+
+--------------------------------------https://searchcode.com/codesearch/view/107133467/--------------------------------------
+<?php
+
+/**
+ * Zend Framework
+ *
+ * LICENSE
+ *
+ * This source file is subject to the new BSD license that is bundled
+ * with this package in the file LICENSE.txt.
+ * It is also available through the world-wide-web at this URL:
+ * http://framework.zend.com/license/new-bsd
+ * If you did not receive a copy of the license and are unable to
+ * obtain it through the world-wide-web, please send an email
+ * to license@zend.com so we can send you a copy immediately.
+ *
+ * @category   Zend
+ * @package    Zend_Gdata
+ * @copyright  Copyright (c) 2005-2007 Zend Technologies USA Inc. (http://www.zend.com)
+ * @license    http://framework.zend.com/license/new-bsd     New BSD License
+ */
+
+/**
+ * Zend_Gdata_Feed
+ */
+require_once 'Zend/Gdata/Feed.php';
+
+/**
+ * Zend_Gdata_Http_Client
+ */
+require_once 'Zend/Http/Client.php';
+
+/**
+ * Zend_Version
+ */
+require_once 'Zend/Version.php';
+
+/**
+ * Provides Atom Publishing Protocol (APP) functionality.  This class and all
+ * other components of Zend_Gdata_App are designed to work independently from
+ * other Zend_Gdata components in order to interact with generic APP services.
+ *
+ * @category   Zend
+ * @package    Zend_Gdata
+ * @copyright  Copyright (c) 2005-2007 Zend Technologies USA Inc. (http://www.zend.com)
+ * @license    http://framework.zend.com/license/new-bsd     New BSD License
+ */
+class Zend_Gdata_App
+{
+
+    /**
+     * Client object used to communicate
+     *
+     * @var Zend_Http_Client
+     */
+    protected $_httpClient;
+
+    /**
+     * Client object used to communicate in static context
+     *
+     * @var Zend_Http_Client
+     */
+    protected static $_staticHttpClient = null;
+
+    /**
+     * Override HTTP PUT and DELETE request methods?
+     *
+     * @var boolean
+     */
+    protected static $_httpMethodOverride = false;
+
+    /**
+     * Default URI to which to POST.
+     *
+     * @var string
+     */
+    protected $_defaultPostUri = null;
+
+    /**
+     * Packages to search for classes when using magic __call method, in order.
+     *
+     * @var array
+     */
+    protected $_registeredPackages = array(
+            'Zend_Gdata_App_Extension',
+            'Zend_Gdata_App');
+
+    /**
+     * Maximum number of redirects to follow during HTTP operations
+     *
+     * @var int
+     */
+    protected static $_maxRedirects = 5;
+
+    /**
+     * Create Gdata object
+     *
+     * @param Zend_Http_Client $client
+     */
+    public function __construct($client = null)
+    {
+        $this->setHttpClient($client);
+    }
+
+    /**
+     * Adds a Zend Framework package to the $_registeredPackages array.
+     * This array is searched when using the magic __call method below
+     * to instantiante new objects.
+     *
+     * @param string $name The name of the package (eg Zend_Gdata_App)
+     * @return void
+     */
+    public function registerPackage($name)
+    {
+        array_unshift($this->_registeredPackages, $name);
+    }
+
+    /**
+     * Retreive feed object
+     *
+     * @param string $uri The uri from which to retrieve the feed
+     * @param string $className The class which is used as the return type
+     * @return Zend_Gdata_App_Feed
+     */
+    public function getFeed($uri, $className='Zend_Gdata_App_Feed')
+    {
+        return $this->import($uri, $this->_httpClient, $className);
+    }
+
+    /**
+     * Retreive entry object
+     *
+     * @param string $uri
+     * @param string $className The class which is used as the return type
+     * @return Zend_Gdata_App_Entry
+     */
+    public function getEntry($uri, $className='Zend_Gdata_App_Entry')
+    {
+        return $this->import($uri, $this->_httpClient, $className);
+    }
+
+    /**
+
+    /**
+     * Get the Zend_Http_Client object used for communication
+     *
+     * @return Zend_Http_Client
+     */
+    public function getHttpClient()
+    {
+        return $this->_httpClient;
+    }
+
+    /**
+     * Set the Zend_Http_Client object used for communication
+     *
+     * @param Zend_Http_Client $client The client to use for communication
+     * @throws Zend_Gdata_App_HttpException
+     * @return Zend_Gdata_App Provides a fluent interface
+     */
+    public function setHttpClient($client)
+    {
+        if ($client === null) {
+            $client = new Zend_Http_Client();
+        }
+        if (!$client instanceof Zend_Http_Client) {
+            require_once 'Zend/Gdata/App/HttpException.php';
+            throw new Zend_Gdata_App_HttpException('Argument is not an instance of Zend_Http_Client.');
+        }
+        $useragent = 'Zend_Framework_Gdata/' . Zend_Version::VERSION;
+        $client->setConfig(array(
+            'strictredirects' => true,
+            'useragent' => $useragent
+            )
+        );
+        $this->_httpClient = $client;
+        Zend_Gdata::setStaticHttpClient($client);
+        return $this;
+    }
+
+
+    /**
+     * Set the static HTTP client instance
+     *
+     * Sets the static HTTP client object to use for retrieving the feed.
+     *
+     * @param  Zend_Http_Client $httpClient
+     * @return void
+     */
+    public static function setStaticHttpClient(Zend_Http_Client $httpClient)
+    {
+        self::$_staticHttpClient = $httpClient;
+    }
+
+
+    /**
+     * Gets the HTTP client object. If none is set, a new Zend_Http_Client will be used.
+     *
+     * @return Zend_Http_Client
+     */
+    public static function getStaticHttpClient()
+    {
+        if (!self::$_staticHttpClient instanceof Zend_Http_Client) {
+            $client = new Zend_Http_Client();
+            $useragent = 'Zend_Framework_Gdata/' . Zend_Version::VERSION;
+            $client->setConfig(array(
+                'strictredirects' => true,
+                'useragent' => $useragent
+                )
+            );
+            self::$_staticHttpClient = $client;
+        }
+        return self::$_staticHttpClient;
+    }
+
+    /**
+     * Toggle using POST instead of PUT and DELETE HTTP methods
+     *
+     * Some feed implementations do not accept PUT and DELETE HTTP
+     * methods, or they can't be used because of proxies or other
+     * measures. This allows turning on using POST where PUT and
+     * DELETE would normally be used; in addition, an
+     * X-Method-Override header will be sent with a value of PUT or
+     * DELETE as appropriate.
+     *
+     * @param  boolean $override Whether to override PUT and DELETE with POST.
+     * @return void
+     */
+    public static function setHttpMethodOverride($override = true)
+    {
+        self::$_httpMethodOverride = $override;
+    }
+
+    /**
+     * Get the HTTP override state
+     *
+     * @return boolean
+     */
+    public static function getHttpMethodOverride()
+    {
+        return self::$_httpMethodOverride;
+    }
+
+    /**
+     * Set the maximum number of redirects to follow during HTTP operations
+     *
+     * @param int $maxRedirects Maximum number of redirects to follow
+     * @return void
+     */
+    public static function setMaxRedirects($maxRedirects)
+    {
+        self::$_maxRedirects = $maxRedirects;
+    }
+
+    /**
+     * Get the maximum number of redirects to follow during HTTP operations
+     *
+     * @return int Maximum number of redirects to follow
+     */
+    public static function getMaxRedirects()
+    {
+        return self::$_maxRedirects;
+    }
+
+    /**
+     * Imports a feed located at $uri.
+     *
+     * @param  string $uri
+     * @param  Zend_Http_Client $client The client used for communication
+     * @param  string $className The class which is used as the return type
+     * @throws Zend_Gdata_App_Exception
+     * @return Zend_Gdata_App_Feed
+     */
+    public static function import($uri, $client = null, $className='Zend_Gdata_App_Feed')
+    {
+        $client->resetParameters();
+        $client->setHeaders('x-http-method-override', null);
+        $client->setUri($uri);
+        $client->setConfig(array('maxredirects' => self::getMaxRedirects()));
+        $response = $client->request('GET');
+        if ($response->getStatus() !== 200) {
+            require_once 'Zend/Gdata/App/HttpException.php';
+            $exception = new Zend_Gdata_App_HttpException('Expected response code 200, got ' . $response->getStatus());
+            $exception->setResponse($response);
+            throw $exception;
+        }
+        $feedContent = $response->getBody();
+        $feed = self::importString($feedContent, $className);
+        if ($client != null) {
+            $feed->setHttpClient($client);
+        } else {
+            $feed->setHttpClient(self::getStaticHttpClient());
+        }
+        return $feed;
+    }
+
+
+    /**
+     * Imports a feed represented by $string.
+     *
+     * @param  string $string
+     * @param  string $className The class which is used as the return type
+     * @throws Zend_Gdata_App_Exception
+     * @return Zend_Gdata_App_Feed
+     */
+    public static function importString($string, $className='Zend_Gdata_App_Feed')
+    {
+        // Load the feed as an XML DOMDocument object
+        @ini_set('track_errors', 1);
+        $doc = new DOMDocument();
+        $success = @$doc->loadXML($string);
+        @ini_restore('track_errors');
+
+        if (!$success) {
+            require_once 'Zend/Gdata/App/Exception.php';
+            throw new Zend_Gdata_App_Exception("DOMDocument cannot parse XML: $php_errormsg");
+        }
+        $feed = new $className($string);
+        $feed->setHttpClient(self::getstaticHttpClient());
+        return $feed;
+    }
+
+
+    /**
+     * Imports a feed from a file located at $filename.
+     *
+     * @param  string $filename
+     * @param  string $className The class which is used as the return type
+     * @param  string $useIncludePath Whether the include_path should be searched
+     * @throws Zend_Gdata_App_Exception
+     * @return Zend_Gdata_Feed
+     */
+    public static function importFile($filename,
+            $className='Zend_Gdata_App_Feed', $useIncludePath = false)
+    {
+        @ini_set('track_errors', 1);
+        $feed = @file_get_contents($filename, $useIncludePath);
+        @ini_restore('track_errors');
+        if ($feed === false) {
+            require_once 'Zend/Gdata/App/Exception.php';
+            throw new Zend_Gdata_App_Exception("File could not be loaded: $php_errormsg");
+        }
+        return self::importString($feed, $className);
+    }
+
+    /**
+     * GET a uri using client object
+     *
+     * @param  string $uri
+     * @throws Zend_Gdata_App_HttpException
+     * @return Zend_Http_Response
+     */
+    public function get($uri)
+    {
+        $client->setConfig(array('maxredirects' => self::getMaxRedirects()));
+        $client->resetParameters();
+        $client->setHeaders('x-http-method-override', null);
+        $client->setUri($uri);
+        $response = $client->request('GET');
+        if ($response->getStatus() !== 200) {
+            require_once 'Zend/Gdata/App/HttpException.php';
+            $exception = new Zend_Gdata_App_HttpException('Expected response code 200, got ' . $response->getStatus());
+            $exception->setResponse($response);
+            throw $exception;
+        }
+        return $response;
+    }
+
+    /**
+     * POST data with client object
+     *
+     * @param mixed $data The Zend_Gdata_App_Entry or XML to post
+     * @param string $uri POST URI
+     * @return Zend_Http_Response
+     * @throws Zend_Gdata_App_Exception
+     * @throws Zend_Gdata_App_HttpException
+     * @throws Zend_Gdata_App_InvalidArgumentException
+     */
+    public function post($data, $uri = null, $remainingRedirects = null)
+    {
+        require_once 'Zend/Http/Client/Exception.php';
+        if ($remainingRedirects === null) {
+            $remainingRedirects = self::getMaxRedirects();
+        }
+        if (is_string($data)) {
+            $rawData = $data;
+        } elseif ($data instanceof Zend_Gdata_App_Entry) {
+            $rawData = $data->saveXML();
+        } else {
+            require_once 'Zend/Gdata/App/InvalidArgumentException.php';
+            throw new Zend_Gdata_App_InvalidArgumentException(
+                    'You must specify the data to post as either a string or a child of Zend_Gdata_App_Entry');
+        }
+        if ($uri === null) {
+            $uri = $this->_defaultPostUri;
+        }
+        if ($uri === null) {
+            require_once 'Zend/Gdata/App/InvalidArgumentException.php';
+            throw new Zend_Gdata_App_InvalidArgumentException('You must specify an URI to which to post.');
+        }
+        $this->_httpClient->resetParameters();
+        $this->_httpClient->setHeaders('x-http-method-override', null);
+        $this->_httpClient->setUri($uri);
+        $this->_httpClient->setConfig(array('maxredirects' => 0));
+        $this->_httpClient->setRawData($rawData,'application/atom+xml');
+        try {
+            $response = $this->_httpClient->request('POST');
+        } catch (Zend_Http_Client_Exception $e) {
+            require_once 'Zend/Gdata/App/HttpException.php';
+            throw new Zend_Gdata_App_HttpException($e->getMessage(), $e, $response);
+        }
+        /**
+         * set "S" cookie to avoid future redirects.
+         * TEMPORARILY removed until Zend_Http_Client has a method to set
+         * raw cookie data
+        if($cookie = $response->getHeader('Set-cookie')) {
+            list($cookieName, $cookieValue) = explode('=', $cookie, 2);
+            $this->_httpClient->setCookie($cookieName, $cookieValue);
+        }
+         */
+        if ($response->isRedirect()) {
+            if ($remainingRedirects > 0) {
+                $newUri = $response->getHeader('Location');
+                $response = $this->post($data, $newUri, $remainingRedirects - 1);
+            } else {
+                require_once 'Zend/Gdata/App/HttpException.php';
+                throw new Zend_Gdata_App_HttpException(
+                        'No more redirects allowed', null, $response);
+            }
+        }
+        if (!$response->isSuccessful()) {
+            require_once 'Zend/Gdata/App/HttpException.php';
+            $exception = new Zend_Gdata_App_HttpException('Expected response code 200, got ' . $response->getStatus());
+            $exception->setResponse($response);
+            throw $exception;
+        }
+        return $response;
+    }
+
+    /**
+     * PUT data with client object
+     *
+     * @param mixed $data The Zend_Gdata_App_Entry or XML to post
+     * @param string $uri PUT URI
+     * @return Zend_Http_Response
+     * @throws Zend_Gdata_App_Exception
+     * @throws Zend_Gdata_App_HttpException
+     * @throws Zend_Gdata_App_InvalidArgumentException
+     */
+    public function put($data, $uri = null, $remainingRedirects = null)
+    {
+        require_once 'Zend/Http/Client/Exception.php';
+        if ($remainingRedirects === null) {
+            $remainingRedirects = self::getMaxRedirects();
+        }
+        if (is_string($data)) {
+            $rawData = $data;
+        } elseif ($data instanceof Zend_Gdata_App_Entry) {
+            $rawData = $data->saveXML();
+        } else {
+            require_once 'Zend/Gdata/App/InvalidArgumentException.php';
+            throw new Zend_Gdata_App_InvalidArgumentException(
+                    'You must specify the data to post as either a string or a child of Zend_Gdata_App_Entry');
+        }
+        if ($uri === null) {
+            if ($data instanceof Zend_Gdata_App_Entry) {
+                $editLink = $data->getEditLink();
+                if ($editLink != null) {
+                    $uri = $editLink->getHref();
+                }
+            }
+        }
+        if ($uri === null) {
+            require_once 'Zend/Gdata/App/InvalidArgumentException.php';
+            throw new Zend_Gdata_App_InvalidArgumentException('You must specify an URI to which to put.');
+        }
+        $this->_httpClient->resetParameters();
+        $this->_httpClient->setHeaders('x-http-method-override', null);
+        $this->_httpClient->setUri($uri);
+        $this->_httpClient->setConfig(array('maxredirects' => 0));
+        $this->_httpClient->setRawData($rawData,'application/atom+xml');
+        try {
+            if (Zend_Gdata_App::getHttpMethodOverride()) {
+                $this->_httpClient->setHeaders(array('X-HTTP-Method-Override: PUT',
+                    'Content-Type: application/atom+xml'));
+                $response = $this->_httpClient->request('POST');
+            } else {
+                $this->_httpClient->setHeaders('Content-Type', 'application/atom+xml');
+                $response = $this->_httpClient->request('PUT');
+            }
+        } catch (Zend_Http_Client_Exception $e) {
+            require_once 'Zend/Gdata/App/HttpException.php';
+            throw new Zend_Gdata_App_HttpException($e->getMessage(), $e);
+        }
+        /**
+         * set "S" cookie to avoid future redirects.
+         * TEMPORARILY removed until Zend_Http_Client has a method to set
+         * raw cookie data
+        if($cookie = $response->getHeader('Set-cookie')) {
+            list($cookieName, $cookieValue) = explode('=', $cookie, 2);
+            $this->_httpClient->setCookie($cookieName, $cookieValue);
+        }
+         */
+        if ($response->isRedirect()) {
+            if ($remainingRedirects > 0) {
+                $newUri = $response->getHeader('Location');
+                $response = $this->put($data, $newUri, $remainingRedirects - 1);
+            } else {
+                require_once 'Zend/Gdata/App/HttpException.php';
+                throw new Zend_Gdata_App_HttpException(
+                        'No more redirects allowed', null, $response);
+            }
+        }
+        if (!$response->isSuccessful()) {
+            require_once 'Zend/Gdata/App/HttpException.php';
+            $exception = new Zend_Gdata_App_HttpException('Expected response code 200, got ' . $response->getStatus());
+            $exception->setResponse($response);
+            throw $exception;
+        }
+        return $response;
+    }
+
+    /**
+     * DELETE entry with client object
+     *
+     * @param mixed $data The Zend_Gdata_App_Entry or URL to delete
+     * @return void
+     * @throws Zend_Gdata_App_Exception
+     * @throws Zend_Gdata_App_HttpException
+     * @throws Zend_Gdata_App_InvalidArgumentException
+     */
+    public function delete($data, $remainingRedirects = null)
+    {
+        require_once 'Zend/Http/Client/Exception.php';
+        if ($remainingRedirects === null) {
+            $remainingRedirects = self::getMaxRedirects();
+        }
+        if (is_string($data)) {
+            $uri = $data;
+        } elseif ($data instanceof Zend_Gdata_App_Entry) {
+            $editLink = $data->getEditLink();
+            if ($editLink != null) {
+                $uri = $editLink->getHref();
+            }
+        } else {
+            require_once 'Zend/Gdata/App/InvalidArgumentException.php';
+            throw new Zend_Gdata_App_InvalidArgumentException(
+                    'You must specify the data to post as either a string or a child of Zend_Gdata_App_Entry');
+        }
+        if ($uri === null) {
+            require_once 'Zend/Gdata/App/InvalidArgumentException.php';
+            throw new Zend_Gdata_App_InvalidArgumentException('You must specify an URI which needs deleted.');
+        }
+        $this->_httpClient->resetParameters();
+        $this->_httpClient->setHeaders('x-http-method-override', null);
+        $this->_httpClient->setUri($uri);
+        $this->_httpClient->setConfig(array('maxredirects' => 0));
+        try {
+            if (Zend_Gdata_App::getHttpMethodOverride()) {
+                $this->_httpClient->setHeaders(array('X-HTTP-Method-Override: DELETE'));
+                $this->_httpClient->setRawData('');
+                $response = $this->_httpClient->request('POST');
+            } else {
+                $response = $this->_httpClient->request('DELETE');
+            }
+        } catch (Zend_Http_Client_Exception $e) {
+            require_once 'Zend/Gdata/App/HttpException.php';
+            throw new Zend_Gdata_App_HttpException($e->getMessage(), $e);
+        }
+        if ($response->isRedirect()) {
+            if ($remainingRedirects > 0) {
+                $newUri = $response->getHeader('Location');
+                $response = $this->delete($newUri, $remainingRedirects - 1);
+            } else {
+                require_once 'Zend/Gdata/App/HttpException.php';
+                throw new Zend_Gdata_App_HttpException(
+                        'No more redirects allowed', null, $response);
+            }
+        }
+        if (!$response->isSuccessful()) {
+            require_once 'Zend/Gdata/App/HttpException.php';
+            $exception = new Zend_Gdata_App_HttpException('Expected response code 200, got ' . $response->getStatus());
+            $exception->setResponse($response);
+            throw $exception;
+        }
+        return $response;
+    }
+
+    /**
+     * Inserts an entry to a given URI and returns the response as a fully formed Entry.
+     * @param mixed  $data The Zend_Gdata_App_Entry or XML to post
+     * @param string $uri POST URI
+     * @param string $className The class of entry to be returned.
+     * @return Zend_Gdata_App_Entry The entry returned by the service after insertion.
+     */
+    public function insertEntry($data, $uri, $className='Zend_Gdata_App_Entry')
+    {
+        if (is_string($data)) {
+            $rawData = $data;
+        } elseif ($data instanceof Zend_Gdata_App_Entry) {
+            $rawData = $data->saveXML();
+        } else {
+            require_once 'Zend/Gdata/App/InvalidArgumentException.php';
+            throw new Zend_Gdata_App_InvalidArgumentException(
+                    'You must specify the data to post as either a string or a child of Zend_Gdata_App_Entry');
+        }
+        $response = $this->post($rawData, $uri);
+
+        $returnEntry = new $className($response->getBody());
+        $returnEntry->setHttpClient(self::getstaticHttpClient());
+        return $returnEntry;
+    }
+
+    /**
+     * Update an entry
+     *
+     * TODO Determine if App should call Entry to Update or the opposite.
+     * Suspecect opposite would mkae more sense.  Also, this possibly should
+     * take an optional URL to override URL used in the entry, or if an
+     * edit URI/ID is not present in the entry
+     *
+     * @param mixed $data Zend_Gdata_App_Entry or XML (w/ID and link rel='edit')
+     * @return Zend_Gdata_App_Entry The entry returned from the server
+     * @throws Zend_Gdata_App_Exception
+     */
+    public function updateEntry($data, $uri =null, $className = null)
+    {
+        if ($className === null && $data instanceof Zend_Gdata_App_Entry) {
+            $className = get_class($data);
+        } elseif ($className === null) {
+            $className = 'Zend_Gdata_App_Entry';
+        }
+        $response = $this->put($data, $uri);
+        $returnEntry = new $className($response->getBody());
+        $returnEntry->setHttpClient(self::getstaticHttpClient());
+        return $returnEntry;
+    }
+
+    /**
+     * Provides a magic factory method to instantiate new objects with
+     * shorter syntax than would otherwise be required by the Zend Framework
+     * naming conventions.  For instance, to construct a new
+     * Zend_Gdata_Calendar_Extension_Color, a developer simply needs to do
+     * $gCal->newColor().  For this magic constructor, packages are searched
+     * in the same order as which they appear in the $_registeredPackages
+     * array
+     *
+     * @param string $method The method name being called
+     * @param array $args The arguments passed to the call
+     * @throws Zend_Gdata_App_Exception
+     */
+    public function __call($method, $args)
+    {
+        if (preg_match('/^new(\w+)/', $method, $matches)) {
+            $class = $matches[1];
+            $foundClassName = null;
+            foreach ($this->_registeredPackages as $name) {
+                 try {
+                     Zend_Loader::loadClass("${name}_${class}");
+                     $foundClassName = "${name}_${class}";
+                     break;
+                 } catch (Zend_Exception $e) {
+                     // package wasn't here- continue searching
+                 }
+            }
+            if ($foundClassName != null) {
+                $reflectionObj = new ReflectionClass($foundClassName);
+                return $reflectionObj->newInstanceArgs($args);
+            } else {
+                require_once 'Zend/Gdata/App/Exception.php';
+                throw new Zend_Gdata_App_Exception(
+                        "Unable to find '${class}' in registered packages");
+            }
+        } else {
+            require_once 'Zend/Gdata/App/Exception.php';
+            throw new Zend_Gdata_App_Exception("No such method ${method}");
+        }
+    }
+
+    /**
+     * Retrieve all entries for a feed, iterating through pages as necessary.
+     * Be aware that calling this function on a large dataset will take a 
+     * significant amount of time to complete. In some cases this may cause 
+     * execution to timeout without proper precautions in place.
+     *
+     * @param $feed The feed to iterate through.
+     * @return mixed A new feed of the same type as the one originally 
+     *          passed in, containing all relevent entries.
+     */
+    public function retrieveAllEntriesForFeed ($feed) {
+        $feedClass = get_class($feed);
+        $reflectionObj = new ReflectionClass($feedClass);
+        $result = $reflectionObj->newInstance();
+        do {
+            foreach ($feed as $entry) {
+                $result->addEntry($entry);
+            }
+            
+            $next = $feed->getLink('next');
+            if ($next !== null) {
+                $feed = $this->getFeed($next->href, $feedClass);
+            } else {
+                $feed = null;
+            }
+        }
+        while ($feed != null);
+        return $result;
+    }
+}
+
+--------------------------------------https://searchcode.com/codesearch/view/107452166/--------------------------------------
+<?php if (!defined('APPLICATION')) exit();
+/// Include a user-defined bootstrap.
+if(file_exists(PATH_ROOT.DS.'conf'.DS.'bootstrap.before.php'))
+	require_once(PATH_ROOT.DS.'conf'.DS.'bootstrap.before.php');
+	
+/// Define core constants.
+if(!defined('PATH_CONF')) define('PATH_CONF', PATH_ROOT.DS.'conf');
+include(PATH_CONF . DS . 'constants.php');
+if(!defined('PATH_APPLICATIONS')) define('PATH_APPLICATIONS', PATH_ROOT.DS.'applications');
+if(!defined('PATH_CACHE')) define('PATH_CACHE', PATH_ROOT.DS.'cache');
+if(!defined('PATH_LIBRARY')) define('PATH_LIBRARY', PATH_ROOT.DS.'library');
+if(!defined('PATH_LIBRARY_CORE')) define('PATH_LIBRARY_CORE', PATH_LIBRARY.DS.'core');
+if(!defined('PATH_PLUGINS')) define('PATH_PLUGINS', PATH_ROOT.DS.'plugins');
+if(!defined('PATH_THEMES')) define('PATH_THEMES', PATH_ROOT.DS.'themes');
+
+// Make sure a default time zone is set
+if (ini_get('date.timezone') == '')
+   date_default_timezone_set('Canada/Saskatchewan');
+
+/// Include the error handler.
+require_once(PATH_LIBRARY_CORE . DS . 'functions.error.php');
+
+/// Include all the utility libraries.
+
+require_once(PATH_LIBRARY_CORE . DS . 'functions.general.php');
+require_once(PATH_LIBRARY_CORE . DS . 'functions.validation.php');
+
+require_once(PATH_LIBRARY_CORE . DS . 'interface.iauthenticator.php');
+require_once(PATH_LIBRARY_CORE . DS . 'interface.iplugin.php');
+require_once(PATH_LIBRARY_CORE . DS . 'interface.isingleton.php');
+require_once(PATH_LIBRARY_CORE . DS . 'interface.imodule.php');
+
+require_once(PATH_LIBRARY_CORE . DS . 'class.pluggable.php');
+require_once(PATH_LIBRARY_CORE . DS . 'class.controller.php');
+require_once(PATH_LIBRARY_CORE . DS . 'class.dispatcher.php');
+require_once(PATH_LIBRARY_CORE . DS . 'class.filesystem.php');
+require_once(PATH_LIBRARY_CORE . DS . 'class.format.php');
+require_once(PATH_LIBRARY_CORE . DS . 'class.model.php');
+require_once(PATH_LIBRARY_CORE . DS . 'class.module.php');
+require_once(PATH_LIBRARY_CORE . DS . 'class.modulecollection.php');
+require_once(PATH_LIBRARY_CORE . DS . 'class.schema.php');
+require_once(PATH_LIBRARY_CORE . DS . 'class.session.php');
+require_once(PATH_LIBRARY_CORE . DS . 'class.shell.php');
+require_once(PATH_LIBRARY_CORE . DS . 'class.url.php');
+require_once(PATH_LIBRARY_CORE . DS . 'class.validation.php');
+
+/// Include the core Gdn object.
+require_once(PATH_LIBRARY_CORE . DS . 'class.gdn.php');
+
+/// Install the factory.
+require_once(PATH_LIBRARY_CORE . DS . 'class.factory.php');
+Gdn::SetFactory(new Gdn_Factory(), FALSE);
+$FactoryOverwriteBak = Gdn::FactoryOverwrite(FALSE);
+
+/// Install the configuration.
+Gdn::FactoryInstall(Gdn::AliasConfig, 'Gdn_Configuration', PATH_LIBRARY_CORE.DS.'class.configuration.php', Gdn::FactorySingleton);
+$Gdn_Config = Gdn::Factory(Gdn::AliasConfig);
+
+/// Configuration Defaults.
+$Gdn_Config->Load(PATH_CONF.DS.'config-defaults.php', 'Use');
+
+// Load the custom configurations so that we know what apps are enabled.
+$Gdn_Config->Load(PATH_CONF.DS.'config.php', 'Use');
+
+/// Load the configurations for the installed items.
+$Gdn_EnabledApplications = Gdn::Config('EnabledApplications', array());
+foreach ($Gdn_EnabledApplications as $ApplicationName => $ApplicationFolder) {
+	$Gdn_Config->Load(PATH_APPLICATIONS.DS.$ApplicationFolder.DS.'settings'.DS.'configuration.php', 'Use');
+}
+
+/// Load the custom configurations again so that application setting defaults are overridden.
+$Gdn_Config->Load(PATH_CONF.DS.'config.php', 'Use');
+unset($Gdn_Config);
+
+// Redirect to the setup screen if Garden hasn't been installed yet.
+if(!Gdn::Config('Garden.Installed', FALSE) && strpos(Gdn_Url::Request(), 'gardensetup') === FALSE) {
+   header('location: '.CombinePaths(array(Gdn_Url::WebRoot(TRUE), 'index.php/garden/gardensetup'), '/'));
+   exit();
+}
+
+/// Install some of the services.
+// Default database.
+Gdn::FactoryInstall(Gdn::AliasDatabase, 'Gdn_Database', PATH_LIBRARY.DS.'database'.DS.'class.database.php', Gdn::FactorySingleton, array('Database'));
+// Database drivers.
+Gdn::FactoryInstall('MySQLDriver', 'Gdn_MySQLDriver', PATH_LIBRARY.DS.'database'.DS.'class.mysql.driver.php', Gdn::FactoryInstance);
+Gdn::FactoryInstall('MySQLStructure', 'Gdn_MySQLStructure', PATH_LIBRARY.DS.'database'.DS.'class.mysql.structure.php', Gdn::FactoryInstance);
+// Form class
+Gdn::FactoryInstall('Form', 'Gdn_Form', PATH_LIBRARY.DS.'core'.DS.'class.form.php', Gdn::FactoryInstance);
+
+// Identity, Authenticator & Session.
+Gdn::FactoryInstall('Identity', 'Gdn_CookieIdentity', PATH_LIBRARY_CORE.DS.'class.cookieidentity.php');
+$AuthType = Gdn::Config('Garden.Authenticator.Type', 'Password');
+Gdn::FactoryInstall(Gdn::AliasAuthenticator, 'Gdn_'.$AuthType.'Authenticator', PATH_LIBRARY_CORE.DS.'class.'.strtolower($AuthType).'authenticator.php', Gdn::FactorySingleton, array('Garden.Authenticator'));
+Gdn::FactoryInstall(Gdn::AliasSession, 'Gdn_Session', PATH_LIBRARY_CORE.DS.'class.session.php');
+// Dispatcher.
+Gdn::FactoryInstall(Gdn::AliasDispatcher, 'Gdn_Dispatcher', PATH_LIBRARY_CORE.DS.'class.dispatcher.php', Gdn::FactorySingleton);
+// Smarty Templating Engine
+Gdn::FactoryInstall('Smarty', 'Smarty', PATH_LIBRARY.DS.'vendors'.DS.'Smarty-2.6.25'.DS.'libs'.DS.'Smarty.class.php', Gdn::FactorySingleton);
+Gdn::FactoryInstall('ViewHandler.tpl', 'Gdn_Smarty', PATH_LIBRARY_CORE.DS.'class.smarty.php', Gdn::FactorySingleton);
+// Application manager.
+Gdn::FactoryInstall('ApplicationManager', 'Gdn_ApplicationManager', PATH_LIBRARY_CORE.DS.'class.applicationmanager.php', Gdn::FactorySingleton);
+
+// Other objects.
+Gdn::FactoryInstall('Dummy', 'Gdn_Dummy', PATH_LIBRARY_CORE.DS.'class.dummy.php', Gdn::FactorySingleton);
+if(!Gdn::FactoryExists(Gdn::AliasLocale)) {
+	require_once(PATH_LIBRARY_CORE.DS.'class.locale.php');
+	$Gdn_Locale = new Gdn_Locale(Gdn::Config('Garden.Locale', ''), Gdn::Config('EnabledApplications'), Gdn::Config('EnabledPlugins'));
+	Gdn::FactoryInstall(Gdn::AliasLocale, 'Gdn_Locale', PATH_LIBRARY_CORE.DS.'class.locale.php', Gdn::FactorySingleton, $Gdn_Locale);
+	unset($Gdn_Locale);
+}
+// Execute other application startup.
+foreach ($Gdn_EnabledApplications as $ApplicationName => $ApplicationFolder) {
+	// Include the application's bootstrap.
+	$Gdn_Path = PATH_APPLICATIONS.DS.$ApplicationFolder.DS.'settings'.DS.'bootstrap.php';
+	if(file_exists($Gdn_Path))
+		include_once($Gdn_Path);
+		
+	// Include the application's hooks.
+   include_once(PATH_APPLICATIONS . DS . $ApplicationFolder . DS . 'settings' . DS . 'hooks.php');
+}
+unset($Gdn_EnabledApplications);
+unset($Gdn_Path);
+
+// If there is a hooks file in the theme folder, include it.
+$ThemeHooks = PATH_THEMES . DS . Gdn::Config('Garden.Theme', 'default') . DS . 'hooks.php';
+if (file_exists($ThemeHooks))
+	include_once($ThemeHooks);
+
+// Set up the plugin manager (doing this early so it has fewer classes to
+// examine to determine if they are plugins).
+Gdn::FactoryInstall('PluginManager', 'Gdn_PluginManager', PATH_LIBRARY . DS . 'core' . DS . 'class.pluginmanager.php', Gdn::FactorySingleton);
+$PluginManager = Gdn::Factory('PluginManager');
+$PluginInfo = $PluginManager->IncludePlugins();
+$PluginManager->EnabledPlugins = $PluginInfo;
+$PluginManager->RegisterPlugins();
+unset($EnabledPlugins);
+unset($PluginInfo);
+
+Gdn::FactoryOverwrite($FactoryOverwriteBak);
+unset($FactoryOverwriteBak);
+
+/// Include a user-defined bootstrap.
+if(file_exists(PATH_ROOT.DS.'conf'.DS.'bootstrap.after.php'))
+	require_once(PATH_ROOT.DS.'conf'.DS.'bootstrap.after.php');
+	
+// Include "Render" functions now - this way pluggables and custom confs can override them.
+require_once(PATH_LIBRARY_CORE . DS . 'functions.render.php');
+
+--------------------------------------https://searchcode.com/codesearch/view/107967607/--------------------------------------
+<?php
+
+/**
+ * @file classes/core/String.inc.php
+ *
+ * Copyright (c) 2000-2010 John Willinsky
+ * Distributed under the GNU GPL v2. For full terms see the file docs/COPYING.
+ *
+ * @class String
+ * @ingroup core
+ *
+ * @brief String manipulation wrapper class.
+ *
+ */
+
+// $Id$
+
+/*
+ * Perl-compatibile regular expression (PCRE) constants:
+ * These are defined application-wide for consistency
+ */
+
+/*
+ * RFC-2396 URIs
+ *
+ * Thanks to the PEAR Validation package (Tomas V.V.Cox <cox@idecnet.com>,
+ * Pierre-Alain Joye <pajoye@php.net>, Amir Mohammad Saied <amir@php.net>)
+ *
+ * Originally published under the "New BSD License"
+ * http://www.opensource.org/licenses/bsd-license.php
+ */
+define('PCRE_URI', '(?:([a-z][-+.a-z0-9]*):)?' .                                         // Scheme
+                   '(?://' .
+                   '(?:((?:%[0-9a-f]{2}|[-a-z0-9_.!~*\'();:\&=+$,])*)@)?' .              // User
+                   '(?:((?:[a-z0-9](?:[-a-z0-9]*[a-z0-9])?\.)*[a-z](?:[a-z0-9]+)?\.?)' . // Hostname
+                   '|([0-9]{1,3}(?:\.[0-9]{1,3}){3}))' .                                 // IP Address
+                   '(?::([0-9]*))?)' .                                                   // Port
+                   '((?:/(?:%[0-9a-f]{2}|[-a-z0-9_.!~*\'():@\&=+$,;])*)*/?)?' .          // Path
+                   '(?:\?([^#]*))?' .                                                    // Query String
+                   '(?:\#((?:%[0-9a-f]{2}|[-a-z0-9_.!~*\'();/?:@\&=+$,])*))?');          // Fragment
+
+// RFC-2822 email addresses
+define('PCRE_EMAIL_ADDRESS',
+	'[-a-z0-9!#\$%&\'\*\+\/=\?\^_\`\{\|\}~]' . '+' . // One or more atom characters.
+	'(\.' . '[-a-z0-9!#\$%&\'\*\+\/=\?\^_\`\{\|\}~]' . '+)*'. // Followed by zero or more dot separated sets of one or more atom characters.
+	'@'. // Followed by an "at" character.
+	'(' . '([a-z0-9]([-a-z0-9]*[a-z0-9]+)?)' . '{1,63}\.)+'. // Followed by one or max 63 domain characters (dot separated).
+	'([a-z0-9]([-a-z0-9]*[a-z0-9]+)?)' . '{2,63}' // Must be followed by one set consisting a period of two or max 63 domain characters.
+	);
+
+class String {
+	/**
+	 * Perform initialization required for the string wrapper library.
+	 */
+	function init() {
+		$clientCharset = strtolower(Config::getVar('i18n', 'client_charset'));
+
+		// Check if mbstring is installed (requires PHP >= 4.3.0)
+		if (String::hasMBString()) {
+			// mbstring routines are available
+			define('ENABLE_MBSTRING', true);
+
+			// Set up required ini settings for mbstring
+			// FIXME Do any other mbstring settings need to be set?
+			mb_internal_encoding($clientCharset);
+			mb_substitute_character('63');		// question mark
+		}
+
+		// Define modifier to be used in regexp_* routines
+		// FIXME Should non-UTF-8 encodings be supported with mbstring?
+		if ($clientCharset == 'utf-8' && String::hasPCREUTF8()) {
+			define('PCRE_UTF8', 'u');
+		} else {
+			define('PCRE_UTF8', '');
+		}
+	}
+
+	/**
+	 * Check if server has the mbstring library.
+	 * Currently requires PHP >= 4.3.0 (for mb_strtolower, mb_strtoupper,
+	 * and mb_substr_count)
+	 * @return boolean
+	 */
+	function hasMBString() {
+		static $hasMBString;
+		if (isset($hasMBString)) return $hasMBString;
+
+		// If string overloading is active, it will break many of the
+		// native implementations. mbstring.func_overload must be set
+		// to 0, 1 or 4 in php.ini (string overloading disabled).
+		if (ini_get('mbstring.func_overload') && defined('MB_OVERLOAD_STRING')) {
+			$hasMBString = false;
+		} else {
+			$hasMBString = (
+			extension_loaded('mbstring') &&
+			function_exists('mb_strlen') &&
+			function_exists('mb_strpos') &&
+			function_exists('mb_strrpos') &&
+			function_exists('mb_substr') &&
+			function_exists('mb_strtolower') &&
+			function_exists('mb_strtoupper') &&
+			function_exists('mb_substr_count') &&
+			function_exists('mb_send_mail')
+			);
+		}
+		return $hasMBString;
+	}
+
+	/**
+	 * Check if server supports the PCRE_UTF8 modifier.
+	 * @return boolean
+	 */
+	function hasPCREUTF8() {
+		// The PCRE_UTF8 modifier is only supported on PHP >= 4.1.0 (*nix) or PHP >= 4.2.3 (win32)
+		// Evil check to see if PCRE_UTF8 is supported
+		if (@preg_match('//u', '')) {
+			return true;
+		} else {
+			return false;
+		}
+	}
+
+	//
+	// Wrappers for basic string manipulation routines.
+	// See the phputf8 documentation for usage.
+	//
+
+	/**
+	 * @see http://ca.php.net/manual/en/function.strlen.php
+	 */
+	function strlen($string) {
+		if (defined('ENABLE_MBSTRING')) {
+			require_once 'mbstring/core.php';
+		} else {
+		 	require_once 'utils/unicode.php';
+			require_once 'native/core.php';
+		}
+		return utf8_strlen($string);
+	}
+
+	/**
+	 * @see http://ca.php.net/manual/en/function.strpos.php
+	 */
+	function strpos($haystack, $needle, $offset = 0) {
+		if (defined('ENABLE_MBSTRING')) {
+			require_once 'mbstring/core.php';
+		} else {
+		 	require_once 'utils/unicode.php';
+			require_once 'native/core.php';
+		}
+		return utf8_strpos($haystack, $needle, $offset);
+	}
+
+	/**
+	 * @see http://ca.php.net/manual/en/function.strrpos.php
+	 */
+	function strrpos($haystack, $needle) {
+		if (defined('ENABLE_MBSTRING')) {
+			require_once 'mbstring/core.php';
+		} else {
+		 	require_once 'utils/unicode.php';
+			require_once 'native/core.php';
+		}
+		return utf8_strrpos($haystack, $needle, $offset);
+	}
+
+	/**
+	 * @see http://ca.php.net/manual/en/function.substr.php
+	 */
+	function substr($string, $start, $length = false) {
+		if (defined('ENABLE_MBSTRING')) {
+			require_once 'mbstring/core.php';
+		} else {
+			require_once 'utils/unicode.php';
+			require_once 'native/core.php';
+		}
+		return utf8_substr($string, $start, $length);
+	}
+
+	/**
+	 * @see http://ca.php.net/manual/en/function.strtolower.php
+	 */
+	function strtolower($string) {
+		if (defined('ENABLE_MBSTRING')) {
+			require_once 'mbstring/core.php';
+		} else {
+		 	require_once 'utils/unicode.php';
+			require_once 'native/core.php';
+		}
+		return utf8_strtolower($string);
+	}
+
+	/**
+	 * @see http://ca.php.net/manual/en/function.strtoupper.php
+	 */
+	function strtoupper($string) {
+		if (defined('ENABLE_MBSTRING')) {
+			require_once 'mbstring/core.php';
+		} else {
+		 	require_once 'utils/unicode.php';
+			require_once 'native/core.php';
+		}
+		return utf8_strtoupper($string);
+	}
+
+	/**
+	 * @see http://ca.php.net/manual/en/function.ucfirst.php
+	 */
+	function ucfirst($string) {
+		if (defined('ENABLE_MBSTRING')) {
+			require_once 'mbstring/core.php';
+			require_once 'ucfirst.php';
+		} else {
+		 	require_once 'utils/unicode.php';
+			require_once 'native/core.php';
+			require_once 'ucfirst.php';
+		}
+		return utf8_ucfirst($string);
+	}
+
+	/**
+	 * @see http://ca.php.net/manual/en/function.substr_count.php
+	 */
+	function substr_count($haystack, $needle) {
+		if (defined('ENABLE_MBSTRING')) {
+			return mb_substr_count($haystack, $needle); // Requires PHP >= 4.3.0
+		} else {
+			return substr_count($haystack, $needle);
+		}
+	}
+
+	/**
+	 * @see http://ca.php.net/manual/en/function.encode_mime_header.php
+	 */
+	function encode_mime_header($string) {
+		if (defined('ENABLE_MBSTRING')) {
+			return mb_encode_mimeheader($string, mb_internal_encoding(), 'B', MAIL_EOL);
+		}  else {
+			return $string;
+		}
+	}
+
+	/**
+	 * @see http://ca.php.net/manual/en/function.mail.php
+	 */
+	function mail($to, $subject, $message, $additional_headers = '', $additional_parameters = '') {
+		// Cannot use mb_send_mail as it base64 encodes the whole body of the email,
+		// making it useless for multipart emails
+		if (empty($additional_parameters)) {
+			return mail($to, $subject, $message, $additional_headers);
+		} else {
+			return mail($to, $subject, $message, $additional_headers, $additional_parameters);
+		}
+	}
+
+	//
+	// Wrappers for PCRE-compatible regular expression routines.
+	// See the php.net documentation for usage.
+	//
+
+	/**
+	 * @see http://ca.php.net/manual/en/function.regexp_quote.php
+	 */
+	function regexp_quote($string, $delimiter = '/') {
+		return preg_quote($string, $delimiter);
+	}
+
+	/**
+	 * @see http://ca.php.net/manual/en/function.regexp_grep.php
+	 */
+	function regexp_grep($pattern, $input) {
+		if (PCRE_UTF8 && !String::utf8_compliant($input)) $input = String::utf8_bad_strip($input);
+		return preg_grep($pattern . PCRE_UTF8, $input);
+	}
+
+	/**
+	 * @see http://ca.php.net/manual/en/function.regexp_match.php
+	 */
+	function regexp_match($pattern, $subject) {
+		if (PCRE_UTF8 && !String::utf8_compliant($subject)) $subject = String::utf8_bad_strip($subject);
+		return preg_match($pattern . PCRE_UTF8, $subject);
+	}
+
+	/**
+	 * @see http://ca.php.net/manual/en/function.regexp_match_get.php
+	 */
+	function regexp_match_get($pattern, $subject, &$matches) {
+		// NOTE: This function was created since PHP < 5.x does not support optional reference parameters
+		if (PCRE_UTF8 && !String::utf8_compliant($subject)) $subject = String::utf8_bad_strip($subject);
+		return preg_match($pattern . PCRE_UTF8, $subject, $matches);
+	}
+
+	/**
+	 * @see http://ca.php.net/manual/en/function.regexp_match_all.php
+	 */
+	function regexp_match_all($pattern, $subject, &$matches) {
+		if (PCRE_UTF8 && !String::utf8_compliant($subject)) $subject = String::utf8_bad_strip($subject);
+		return preg_match_all($pattern . PCRE_UTF8, $subject, $matches);
+	}
+
+	/**
+	 * @see http://ca.php.net/manual/en/function.regexp_replace.php
+	 */
+	function regexp_replace($pattern, $replacement, $subject, $limit = -1) {
+		if (PCRE_UTF8 && !String::utf8_compliant($subject)) $subject = String::utf8_bad_strip($subject);
+		return preg_replace($pattern . PCRE_UTF8, $replacement, $subject, $limit);
+	}
+
+	/**
+	 * @see http://ca.php.net/manual/en/function.regexp_replace_callback.php
+	 */
+	function regexp_replace_callback($pattern, $callback, $subject, $limit = -1) {
+		if (PCRE_UTF8 && !String::utf8_compliant($subject)) $subject = String::utf8_bad_strip($subject);
+		return preg_replace_callback($pattern . PCRE_UTF8, $callback, $subject, $limit);
+	}
+
+	/**
+	 * @see http://ca.php.net/manual/en/function.regexp_split.php
+	 */
+	function regexp_split($pattern, $subject, $limit = -1) {
+		if (PCRE_UTF8 && !String::utf8_compliant($subject)) $subject = String::utf8_bad_strip($subject);
+		return preg_split($pattern . PCRE_UTF8, $subject, $limit);
+	}
+
+	/**
+	 * @see http://ca.php.net/manual/en/function.mime_content_type.php
+	 */
+	function mime_content_type($filename) {
+		if (function_exists('mime_content_type')) {
+			$result = mime_content_type($filename);
+			// mime_content_type appears to return a charset
+			// (erroneously?) in recent versions of PHP5
+			if (($i = strpos($result, ';')) !== false) {
+				$result = trim(substr($result, 0, $i));
+			}
+			return $result;
+		} elseif (function_exists('finfo_open')) {
+			$localeFiles =& Registry::get('fileInfo', true, null);
+			if ($fi === null) {
+				$fi = finfo_open(FILEINFO_MIME, Config::getVar('finfo', 'mime_database_path'));
+			}
+			if ($fi !== false) {
+				return strtok(finfo_file($fi, $filename), ' ;');
+			}
+		}
+
+		// Fall back on an external "file" tool
+		$f = escapeshellarg($filename);
+		$result = trim(`file --brief --mime $f`);
+		// Make sure we just return the mime type.
+		if (($i = strpos($result, ';')) !== false) {
+			$result = trim(substr($result, 0, $i));
+		}
+		return $result;
+	}
+
+
+	/**
+	 * Strip unsafe HTML from the input text. Covers XSS attacks like scripts,
+	 * onclick(...) attributes, javascript: urls, and special characters.
+	 * @param $input string input string
+	 * @return string
+	 */
+	function stripUnsafeHtml($input) {
+		// Parts of this implementation were taken from Horde:
+		// see http://cvs.horde.org/co.php/framework/MIME/MIME/Viewer/html.php.
+
+		$allowedHtml = Config::getVar('security', 'allowed_html');
+		if ($allowedHtml == '') $allowedHtml = '<a> <em> <strong> <cite> <code> <ul> <ol> <li> <dl> <dt> <dd> <b> <i> <u> <img> <sup> <sub> <br> <p>';
+
+		$html = strip_tags($input, $allowedHtml);
+
+		// Change space entities to space characters
+		$html = preg_replace('/&#(x0*20|0*32);?/i', ' ', $html);
+
+		// Remove non-printable characters
+		$html = preg_replace('/&#x?0*([9A-D]|1[0-3]);/i', '&nbsp;', $html);
+		$html = preg_replace('/&#x?0*[9A-D]([^0-9A-F]|$)/i', '&nbsp\\1', $html);
+		$html = preg_replace('/&#0*(9|1[0-3])([^0-9]|$)/i', '&nbsp\\2', $html);
+
+		// Remove overly long numeric entities
+		$html = preg_replace('/&#x?0*[0-9A-F]{6,};?/i', '&nbsp;', $html);
+
+		/* Get all attribute="javascript:foo()" tags. This is
+		* essentially the regex /(=|url\()("?)[^>]* script:/ but
+		* expanded to catch camouflage with spaces and entities. */
+		$preg 	= '/((&#0*61;?|&#x0*3D;?|=)|'
+			. '((u|&#0*85;?|&#x0*55;?|&#0*117;?|&#x0*75;?)\s*'
+			. '(r|&#0*82;?|&#x0*52;?|&#0*114;?|&#x0*72;?)\s*'
+			. '(l|&#0*76;?|&#x0*4c;?|&#0*108;?|&#x0*6c;?)\s*'
+			. '(\()))\s*'
+			. '(&#0*34;?|&#x0*22;?|"|&#0*39;?|&#x0*27;?|\')?'
+			. '[^>]*\s*'
+			. '(s|&#0*83;?|&#x0*53;?|&#0*115;?|&#x0*73;?)\s*'
+			. '(c|&#0*67;?|&#x0*43;?|&#0*99;?|&#x0*63;?)\s*'
+			. '(r|&#0*82;?|&#x0*52;?|&#0*114;?|&#x0*72;?)\s*'
+			. '(i|&#0*73;?|&#x0*49;?|&#0*105;?|&#x0*69;?)\s*'
+			. '(p|&#0*80;?|&#x0*50;?|&#0*112;?|&#x0*70;?)\s*'
+			. '(t|&#0*84;?|&#x0*54;?|&#0*116;?|&#x0*74;?)\s*'
+			. '(:|&#0*58;?|&#x0*3a;?)/i';
+		$html = preg_replace($preg, '\1\8PKPCleaned', $html);
+
+		/* Get all on<foo>="bar()". NEVER allow these. */
+		$html =	preg_replace('/([\s"\']+'
+			. '(o|&#0*79;?|&#0*4f;?|&#0*111;?|&#0*6f;?)'
+			. '(n|&#0*78;?|&#0*4e;?|&#0*110;?|&#0*6e;?)'
+			. '\w+)\s*=/i', '\1PKPCleaned=', $html);
+
+		$pattern = array(
+			'|<([^>]*)&{.*}([^>]*)>|',
+			'|<([^>]*)mocha:([^>]*)>|i',
+			'|<([^>]*)binding:([^>]*)>|i'
+		);
+		$replace = array('<&{;}\3>', '<\1PKPCleaned:\2>', '<\1PKPCleaned:\2>');
+		$html = preg_replace($pattern, $replace, $html);
+
+		return $html;
+	}
+
+	//
+	// Wrappers for UTF-8 validation routines
+	// See the phputf8 documentation for usage.
+	//
+
+	/**
+	 * Detect whether a string contains non-ascii multibyte sequences in the UTF-8 range
+	 * @param $str string input string
+	 * @return boolean
+	 */
+	function utf8_is_valid($str) {
+		require_once 'utils/validation.php';
+		return utf8_is_valid($str);
+	}
+
+	/**
+	 * Tests whether a string complies as UTF-8; faster and less strict than utf8_is_valid
+	 * see lib/phputf8/utils/validation.php for more details
+	 * @param $str string input string
+	 * @return boolean
+	 */
+	function utf8_compliant($str) {
+		require_once 'utils/validation.php';
+		return utf8_compliant($str);
+	}
+
+	/**
+	 * Locates the first bad byte in a UTF-8 string returning it's byte index in the string
+	 * @param $str string input string
+	 * @return string
+	 */
+	function utf8_bad_find($str) {
+		require_once 'utils/bad.php';
+		return utf8_bad_find($str);
+	}
+
+	/**
+	 * Strips out any bad bytes from a UTF-8 string and returns the rest
+	 * @param $str string input string
+	 * @return string
+	 */
+	function utf8_bad_strip($str) {
+		require_once 'utils/bad.php';
+		return utf8_bad_strip($str);
+	}
+
+	/**
+	 * Replace bad bytes with an alternative character - ASCII character
+	 * @param $str string input string
+	 * @param $replace string optional
+	 * @return string
+	 */
+	function utf8_bad_replace($str, $replace = '?') {
+		require_once 'utils/bad.php';
+		return utf8_bad_replace($str, $replace);
+	}
+
+	/**
+	 * Replace bad bytes with an alternative character - ASCII character
+	 * @param $str string input string
+	 * @return string
+	 */
+	function utf8_strip_ascii_ctrl($str) {
+		require_once 'utils/ascii.php';
+		return utf8_strip_ascii_ctrl($str);
+	}
+
+	/**
+	 * Normalize a string in an unknown (non-UTF8) encoding into a valid UTF-8 sequence
+	 * @param $str string input string
+	 * @return string
+	 */
+	function utf8_normalize($str) {
+		import('core.Transcoder');
+
+		if (String::hasMBString()) {
+			// NB: CP-1252 often segfaults; we've left it out here but it will detect as 'ISO-8859-1'
+			$mb_encoding_order = 'UTF-8, UTF-7, ASCII, ISO-8859-1, EUC-JP, SJIS, eucJP-win, SJIS-win, JIS, ISO-2022-JP';
+
+			if (checkPhpVersion('4.3.8')) {
+				$detected_encoding = mb_detect_encoding($str, $mb_encoding_order, FALSE);
+			} else {
+				$detected_encoding = mb_detect_encoding($str, $mb_encoding_order);
+			}
+
+		} elseif (function_exists('iconv') && strlen(iconv('CP1252', 'UTF-8', $str)) != strlen(iconv('ISO-8859-1', 'UTF-8', $str))) {
+			// use iconv to detect CP-1252, assuming default ISO-8859-1
+			$detected_encoding = 'CP1252';
+		} else {
+			// assume ISO-8859-1, PHP default
+			$detected_encoding = 'ISO-8859-1';
+		}
+
+		// transcode CP-1252/ISO-8859-1 into HTML entities; this works because CP-1252 is mapped onto ISO-8859-1
+		if ('ISO-8859-1' == $detected_encoding || 'CP1252' == $detected_encoding) {
+			$trans = new Transcoder('CP1252', 'HTML-ENTITIES');
+			$str = $trans->trans($str);
+		}
+
+		// transcode from detected encoding to to UTF-8
+		$trans = new Transcoder($detected_encoding, 'UTF-8');
+		$str = $trans->trans($str);
+
+		return $str;
+	}
+
+	/**
+	 * US-ASCII transliterations of Unicode text
+	 * @param $str string input string
+	 * @return string
+	 */
+	function utf8_to_ascii($str) {
+		require_once('utf8_to_ascii.php');
+		return utf8_to_ascii($str);
+	}
+
+	/**
+	 * Returns the UTF-8 string corresponding to the unicode value
+	 * Does not require any multibyte PHP libraries
+	 * (from php.net, courtesy - romans@void.lv)
+	 * @param $num int
+	 * @return string
+	 */
+	function code2utf ($num) {
+		if ($num < 128) return chr($num);
+		if ($num < 2048) return chr(($num >> 6) + 192) . chr(($num & 63) + 128);
+		if ($num < 65536) return chr(($num >> 12) + 224) . chr((($num >> 6) & 63) + 128) . chr(($num & 63) + 128);
+		if ($num < 2097152) return chr(($num >> 18) + 240) . chr((($num >> 12) & 63) + 128) . chr((($num >> 6) & 63) + 128) . chr(($num & 63) + 128);
+		return '';
+	}
+
+	/**
+	 * Convert UTF-8 encoded characters in a string to escaped HTML entities
+	 * This is a helper function for transcoding into HTML or XML for output
+	 * @param $str string input string
+	 * @return string
+	 */
+	function utf2html ($str) {
+		$ret = "";
+		$max = strlen($str);
+		$last = 0;  // keeps the index of the last regular character
+
+		for ($i=0; $i<$max; $i++) {
+			$c = $str{$i};
+			$c1 = ord($c);
+			if ($c1>>5 == 6) {										// 110x xxxx, 110 prefix for 2 bytes unicode
+				$ret .= substr($str, $last, $i-$last);			// append all the regular characters we've passed
+				$c1 &= 31;													// remove the 3 bit two bytes prefix
+				$c2 = ord($str{++$i});								// the next byte
+				$c2 &= 63;													// remove the 2 bit trailing byte prefix
+				$c2 |= (($c1 & 3) << 6);							// last 2 bits of c1 become first 2 of c2
+				$c1 >>= 2;													// c1 shifts 2 to the right
+				$ret .= "&#" . ($c1 * 0x100 + $c2) . ";";	// this is the fastest string concatenation
+				$last = $i+1;
+			}
+			elseif ($c1>>4 == 14) { 								// 1110 xxxx, 110 prefix for 3 bytes unicode
+				$ret .= substr($str, $last, $i-$last);			// append all the regular characters we've passed
+				$c2 = ord($str{++$i}); 								// the next byte
+				$c3 = ord($str{++$i}); 								// the third byte
+				$c1 &= 15; 												// remove the 4 bit three bytes prefix
+				$c2 &= 63; 												// remove the 2 bit trailing byte prefix
+				$c3 &= 63; 												// remove the 2 bit trailing byte prefix
+				$c3 |= (($c2 & 3) << 6);							// last 2 bits of c2 become first 2 of c3
+				$c2 >>=2; 													//c2 shifts 2 to the right
+				$c2 |= (($c1 & 15) << 4);							// last 4 bits of c1 become first 4 of c2
+				$c1 >>= 4; 												// c1 shifts 4 to the right
+				$ret .= '&#' . (($c1 * 0x10000) + ($c2 * 0x100) + $c3) . ';'; // this is the fastest string concatenation
+				$last = $i+1;
+			}
+		}
+		$str=$ret . substr($str, $last, $i); // append the last batch of regular characters
+
+		return $str;
+	}
+
+	/**
+	 * Convert numeric HTML entities in a string to UTF-8 encoded characters
+	 * This is a native alternative to the buggy html_entity_decode() using UTF8
+	 * @param $str string input string
+	 * @return string
+	 */
+	function html2utf($str) {
+		// convert named entities to numeric entities
+		$str = strtr($str, String::getHTMLEntities());
+
+		// use PCRE-aware replace function to replace numeric entities
+		$str = String::regexp_replace('~&#x([0-9a-f]+);~ei', 'String::code2utf(hexdec("\\1"))', $str);
+		$str = String::regexp_replace('~&#([0-9]+);~e', 'String::code2utf(\\1)', $str);
+
+		return $str;
+	}
+
+	/**
+	 * Return an associative array of named->numeric HTML entities
+	 * Required to support HTML functions without objects in PHP4/PHP5
+	 * From php.net: function.get-html-translation-table.php
+	 * @return string
+	 */
+	function getHTMLEntities () {
+		// define the conversion table
+		$html_entities = array(
+			"&Aacute;" => "&#193;",	"&aacute;" => "&#225;",	"&Acirc;" => "&#194;",
+			"&acirc;" => "&#226;",	"&acute;" => "&#180;",	"&AElig;" => "&#198;",
+			"&aelig;" => "&#230;",	"&Agrave;" => "&#192;",	"&agrave;" => "&#224;",
+			"&alefsym;" => "&#8501;","&Alpha;" => "&#913;",	"&alpha;" => "&#945;",
+			"&amp;" => "&#38;",	"&and;" => "&#8743;",	"&ang;" => "&#8736;",
+			"&apos;" => "&#39;",	"&Aring;" => "&#197;",	"&aring;" => "&#229;",
+			"&asymp;" => "&#8776;",	"&Atilde;" => "&#195;",	"&atilde;" => "&#227;",
+			"&Auml;" => "&#196;",	"&auml;" => "&#228;",	"&bdquo;" => "&#8222;",
+			"&Beta;" => "&#914;",	"&beta;" => "&#946;",	"&brvbar;" => "&#166;",
+			"&bull;" => "&#8226;",	"&cap;" => "&#8745;",	"&Ccedil;" => "&#199;",
+			"&ccedil;" => "&#231;",	"&cedil;" => "&#184;",	"&cent;" => "&#162;",
+			"&Chi;" => "&#935;",	"&chi;" => "&#967;",	"&circ;" => "&#94;",
+			"&clubs;" => "&#9827;",	"&cong;" => "&#8773;",	"&copy;" => "&#169;",
+			"&crarr;" => "&#8629;",	"&cup;" => "&#8746;",	"&curren;" => "&#164;",
+			"&dagger;" => "&#8224;","&Dagger;" => "&#8225;", "&darr;" => "&#8595;",
+			"&dArr;" => "&#8659;",	"&deg;" => "&#176;",	"&Delta;" => "&#916;",
+			"&delta;" => "&#948;",	"&diams;" => "&#9830;",	"&divide;" => "&#247;",
+			"&Eacute;" => "&#201;",	"&eacute;" => "&#233;",	"&Ecirc;" => "&#202;",
+			"&ecirc;" => "&#234;",	"&Egrave;" => "&#200;",	"&egrave;" => "&#232;",
+			"&empty;" => "&#8709;",	"&emsp;" => "&#8195;",	"&ensp;" => "&#8194;",
+			"&Epsilon;" => "&#917;","&epsilon;" => "&#949;","&equiv;" => "&#8801;",
+			"&Eta;" => "&#919;",	"&eta;" => "&#951;",	"&ETH;" => "&#208;",
+			"&eth;" => "&#240;",	"&Euml;" => "&#203;",	"&euml;" => "&#235;",
+			"&euro;" => "&#8364;",	"&exist;" => "&#8707;",	"&fnof;" => "&#402;",
+			"&forall;" => "&#8704;","&frac12;" => "&#189;",	"&frac14;" => "&#188;",
+			"&frac34;" => "&#190;",	"&frasl;" => "&#8260;",	"&Gamma;" => "&#915;",
+			"&gamma;" => "&#947;",	"&ge;" => "&#8805;",	"&gt;" => "&#62;",
+			"&harr;" => "&#8596;",	"&hArr;" => "&#8660;",	"&hearts;" => "&#9829;",
+			"&hellip;" => "&#8230;","&Iacute;" => "&#205;",	"&iacute;" => "&#237;",
+			"&Icirc;" => "&#206;",	"&icirc;" => "&#238;",	"&iexcl;" => "&#161;",
+			"&Igrave;" => "&#204;",	"&igrave;" => "&#236;",	"&image;" => "&#8465;",
+			"&infin;" => "&#8734;",	"&int;" => "&#8747;",	"&Iota;" => "&#921;",
+			"&iota;" => "&#953;",	"&iquest;" => "&#191;",	"&isin;" => "&#8712;",
+			"&Iuml;" => "&#207;",	"&iuml;" => "&#239;",	"&Kappa;" => "&#922;",
+			"&kappa;" => "&#954;",	"&Lambda;" => "&#923;",	"&lambda;" => "&#955;",
+			"&lang;" => "&#9001;",	"&laquo;" => "&#171;",	"&larr;" => "&#8592;",
+			"&lArr;" => "&#8656;",	"&lceil;" => "&#8968;",
+			"&ldquo;" => "&#8220;",	"&le;" => "&#8804;",	"&lfloor;" => "&#8970;",
+			"&lowast;" => "&#8727;","&loz;" => "&#9674;",	"&lrm;" => "&#8206;",
+			"&lsaquo;" => "&#8249;","&lsquo;" => "&#8216;",	"&lt;" => "&#60;",
+			"&macr;" => "&#175;",	"&mdash;" => "&#8212;",	"&micro;" => "&#181;",
+			"&middot;" => "&#183;",	"&minus;" => "&#45;",	"&Mu;" => "&#924;",
+			"&mu;" => "&#956;",	"&nabla;" => "&#8711;",	"&nbsp;" => "&#160;",
+			"&ndash;" => "&#8211;",	"&ne;" => "&#8800;",	"&ni;" => "&#8715;",
+			"&not;" => "&#172;",	"&notin;" => "&#8713;",	"&nsub;" => "&#8836;",
+			"&Ntilde;" => "&#209;",	"&ntilde;" => "&#241;",	"&Nu;" => "&#925;",
+			"&nu;" => "&#957;",	"&Oacute;" => "&#211;",	"&oacute;" => "&#243;",
+			"&Ocirc;" => "&#212;",	"&ocirc;" => "&#244;",	"&OElig;" => "&#338;",
+			"&oelig;" => "&#339;",	"&Ograve;" => "&#210;",	"&ograve;" => "&#242;",
+			"&oline;" => "&#8254;",	"&Omega;" => "&#937;",	"&omega;" => "&#969;",
+			"&Omicron;" => "&#927;","&omicron;" => "&#959;","&oplus;" => "&#8853;",
+			"&or;" => "&#8744;",	"&ordf;" => "&#170;",	"&ordm;" => "&#186;",
+			"&Oslash;" => "&#216;",	"&oslash;" => "&#248;",	"&Otilde;" => "&#213;",
+			"&otilde;" => "&#245;",	"&otimes;" => "&#8855;","&Ouml;" => "&#214;",
+			"&ouml;" => "&#246;",	"&para;" => "&#182;",	"&part;" => "&#8706;",
+			"&permil;" => "&#8240;","&perp;" => "&#8869;",	"&Phi;" => "&#934;",
+			"&phi;" => "&#966;",	"&Pi;" => "&#928;",	"&pi;" => "&#960;",
+			"&piv;" => "&#982;",	"&plusmn;" => "&#177;",	"&pound;" => "&#163;",
+			"&prime;" => "&#8242;",	"&Prime;" => "&#8243;",	"&prod;" => "&#8719;",
+			"&prop;" => "&#8733;",	"&Psi;" => "&#936;",	"&psi;" => "&#968;",
+			"&quot;" => "&#34;",	"&radic;" => "&#8730;",	"&rang;" => "&#9002;",
+			"&raquo;" => "&#187;",	"&rarr;" => "&#8594;",	"&rArr;" => "&#8658;",
+			"&rceil;" => "&#8969;",	"&rdquo;" => "&#8221;",	"&real;" => "&#8476;",
+			"&reg;" => "&#174;",	"&rfloor;" => "&#8971;","&Rho;" => "&#929;",
+			"&rho;" => "&#961;",	"&rlm;" => "&#8207;",	"&rsaquo;" => "&#8250;",
+			"&rsquo;" => "&#8217;",	"&sbquo;" => "&#8218;",	"&Scaron;" => "&#352;",
+			"&scaron;" => "&#353;",	"&sdot;" => "&#8901;",	"&sect;" => "&#167;",
+			"&shy;" => "&#173;",	"&Sigma;" => "&#931;",	"&sigma;" => "&#963;",
+			"&sigmaf;" => "&#962;",	"&sim;" => "&#8764;",	"&spades;" => "&#9824;",
+			"&sub;" => "&#8834;",	"&sube;" => "&#8838;",	"&sum;" => "&#8721;",
+			"&sup1;" => "&#185;",	"&sup2;" => "&#178;",	"&sup3;" => "&#179;",
+			"&sup;" => "&#8835;",	"&supe;" => "&#8839;",	"&szlig;" => "&#223;",
+			"&Tau;" => "&#932;",	"&tau;" => "&#964;",	"&there4;" => "&#8756;",
+			"&Theta;" => "&#920;",	"&theta;" => "&#952;",	"&thetasym;" => "&#977;",
+			"&thinsp;" => "&#8201;","&THORN;" => "&#222;",	"&thorn;" => "&#254;",
+			"&tilde;" => "&#126;",	"&times;" => "&#215;",	"&trade;" => "&#8482;",
+			"&Uacute;" => "&#218;",	"&uacute;" => "&#250;",	"&uarr;" => "&#8593;",
+			"&uArr;" => "&#8657;",	"&Ucirc;" => "&#219;",	"&ucirc;" => "&#251;",
+			"&Ugrave;" => "&#217;",	"&ugrave;" => "&#249;",	"&uml;" => "&#168;",
+			"&upsih;" => "&#978;",	"&Upsilon;" => "&#933;","&upsilon;" => "&#965;",
+			"&Uuml;" => "&#220;",	"&uuml;" => "&#252;",	"&weierp;" => "&#8472;",
+			"&Xi;" => "&#926;",	"&xi;" => "&#958;",	"&Yacute;" => "&#221;",
+			"&yacute;" => "&#253;",	"&yen;" => "&#165;",	"&yuml;" => "&#255;",
+			"&Yuml;" => "&#376;",	"&Zeta;" => "&#918;",	"&zeta;" => "&#950;",
+			"&zwj;" => "&#8205;",	"&zwnj;" => "&#8204;"
+		);
+
+		return $html_entities;
+	}
+
+	/**
+	 * Wrapper around fputcsv for systems that may or may not support it
+	 * (i.e. PHP before 5.1.0); see PHP documentation for fputcsv.
+	 */
+	function fputcsv(&$handle, $fields = array(), $delimiter = ',', $enclosure = '"') {
+		// From PHP website, thanks to boefje at hotmail dot com
+		if (function_exists('fputcsv')) {
+			return fputcsv($handle, $fields, $delimiter, $enclosure);
+		}
+		$str = '';
+		$escape_char = '\\';
+		foreach ($fields as $value) {
+			if (	strpos($value, $delimiter) !== false ||
+				strpos($value, $enclosure) !== false ||
+				strpos($value, "\n") !== false ||
+				strpos($value, "\r") !== false ||
+				strpos($value, "\t") !== false ||
+				strpos($value, ' ') !== false
+			) {
+				$str2 = $enclosure;
+				$escaped = 0;
+				$len = strlen($value);
+				for ($i=0; $i<$len; $i++) {
+					if ($value[$i] == $escape_char) $escaped = 1;
+					elseif (!$escaped && $value[$i] == $enclosure) $str2 .= $enclosure;
+					else $escaped = 0;
+					$str2 .= $value[$i];
+				}
+				$str2 .= $enclosure;
+				$str .= $str2 . $delimiter;
+			} else {
+				$str .= $value . $delimiter;
+			}
+		}
+		$str = substr($str, 0, -1);
+		$str .= "\n";
+		return fwrite($handle, $str);
+	}
+
+	/**
+	 * Trim punctuation from a string
+	 * @param $string string input string
+	 * @return string the trimmed string
+	 */
+	function trimPunctuation($string) {
+		return trim($string, ' ,.;:!?()[]\\/');
+	}
+
+	/**
+	 * Convert a string to proper title case
+	 * @param $title string
+	 * @return string
+	 */
+	function titleCase($title) {
+		$smallWords = array(
+			'of', 'a', 'the', 'and', 'an', 'or', 'nor', 'but', 'is', 'if', 'then',
+			'else', 'when', 'at', 'from', 'by', 'on', 'off', 'for', 'in', 'out',
+			'over', 'to', 'into', 'with'
+		);
+
+		$words = explode(' ', $title);
+		foreach ($words as $key => $word) {
+			if ($key == 0 or !in_array(self::strtolower($word), $smallWords)) {
+				$words[$key] = ucfirst(self::strtolower($word));
+			} else {
+				$words[$key] = self::strtolower($word);
+			}
+		}
+
+		$newTitle = implode(' ', $words);
+		return $newTitle;
+	}
+
+	/**
+	 * Iterate over an array of delimiters and see whether
+	 * it exists in the given input string. If so, then use
+	 * it to explode the string into an array.
+	 * @param $delimiters array
+	 * @param $input string
+	 * @return array
+	 */
+	function iterativeExplode($delimiters, $input) {
+		// Run through the delimiters and try them out
+		// one by one.
+		foreach($delimiters as $delimiter) {
+			if (strstr($input, $delimiter) !== false) {
+				return explode($delimiter, $input);
+			}
+		}
+
+		// If none of the delimiters works then return
+		// the original string as an array.
+		return (array($input));
+	}
+}
+
+?>
+
+--------------------------------------https://searchcode.com/codesearch/view/108295380/--------------------------------------
+<?php
+/**
+ * Zend Framework
+ *
+ * LICENSE
+ *
+ * This source file is subject to the new BSD license that is bundled
+ * with this package in the file LICENSE.txt.
+ * It is also available through the world-wide-web at this URL:
+ * http://framework.zend.com/license/new-bsd
+ * If you did not receive a copy of the license and are unable to
+ * obtain it through the world-wide-web, please send an email
+ * to license@zend.com so we can send you a copy immediately.
+ *
+ * @category   Zend
+ * @package    Zend_Feed
+ * @subpackage UnitTests
+ * @copyright  Copyright (c) 2005-2010 Zend Technologies USA Inc. (http://www.zend.com)
+ * @license    http://framework.zend.com/license/new-bsd     New BSD License
+ * @version    $Id$
+ */
+
+require_once dirname(dirname(dirname(__FILE__))) . DIRECTORY_SEPARATOR . 'TestHelper.php';
+
+if (!defined('PHPUnit_MAIN_METHOD')) {
+    define('PHPUnit_MAIN_METHOD', 'Zend_Feed_AllTests::main');
+}
+
+require_once 'Zend/Feed/ArrayAccessTest.php';
+require_once 'Zend/Feed/AtomEntryOnlyTest.php';
+require_once 'Zend/Feed/AtomPublishingTest.php';
+require_once 'Zend/Feed/CountTest.php';
+require_once 'Zend/Feed/ElementTest.php';
+require_once 'Zend/Feed/ImportTest.php';
+require_once 'Zend/Feed/IteratorTest.php';
+require_once 'Zend/Feed/Entry/RssTest.php';
+
+require_once 'Zend/Feed/ReaderTest.php';
+require_once 'Zend/Feed/Reader/Feed/RssTest.php';
+require_once 'Zend/Feed/Reader/Entry/RssTest.php';
+require_once 'Zend/Feed/Reader/Feed/AtomTest.php';
+require_once 'Zend/Feed/Reader/Entry/AtomTest.php';
+require_once 'Zend/Feed/Reader/Feed/CommonTest.php';
+require_once 'Zend/Feed/Reader/Entry/CommonTest.php';
+
+require_once 'Zend/Feed/Reader/Feed/AtomSourceTest.php';
+require_once 'Zend/Feed/Reader/Entry/AtomStandaloneEntryTest.php';
+
+require_once 'Zend/Feed/Reader/Integration/WordpressRss2DcAtomTest.php';
+require_once 'Zend/Feed/Reader/Integration/WordpressAtom10Test.php';
+require_once 'Zend/Feed/Reader/Integration/LautDeRdfTest.php';
+require_once 'Zend/Feed/Reader/Integration/H-OnlineComAtom10Test.php';
+
+require_once 'Zend/Feed/Writer/FeedTest.php';
+require_once 'Zend/Feed/Writer/EntryTest.php';
+require_once 'Zend/Feed/Writer/DeletedTest.php';
+require_once 'Zend/Feed/Writer/Renderer/Feed/AtomTest.php';
+require_once 'Zend/Feed/Writer/Renderer/Feed/RssTest.php';
+require_once 'Zend/Feed/Writer/Renderer/Entry/AtomTest.php';
+require_once 'Zend/Feed/Writer/Renderer/Entry/RssTest.php';
+
+require_once 'Zend/Feed/Writer/Extension/ITunes/EntryTest.php';
+require_once 'Zend/Feed/Writer/Extension/ITunes/FeedTest.php';
+
+require_once 'Zend/Feed/Pubsubhubbub/AllTests.php';
+
+/**
+ * @category   Zend
+ * @package    Zend_Feed
+ * @subpackage UnitTests
+ * @copyright  Copyright (c) 2005-2010 Zend Technologies USA Inc. (http://www.zend.com)
+ * @license    http://framework.zend.com/license/new-bsd     New BSD License
+ * @group      Zend_Feed
+ */
+class Zend_Feed_AllTests
+{
+    public static function main()
+    {
+        PHPUnit_TextUI_TestRunner::run(self::suite());
+    }
+
+    public static function suite()
+    {
+        $suite = new PHPUnit_Framework_TestSuite('Zend Framework - Zend_Feed');
+
+        $suite->addTestSuite('Zend_Feed_ArrayAccessTest');
+        $suite->addTestSuite('Zend_Feed_AtomEntryOnlyTest');
+        $suite->addTestSuite('Zend_Feed_AtomPublishingTest');
+        $suite->addTestSuite('Zend_Feed_CountTest');
+        $suite->addTestSuite('Zend_Feed_ElementTest');
+        $suite->addTestSuite('Zend_Feed_ImportTest');
+        $suite->addTestSuite('Zend_Feed_IteratorTest');
+        $suite->addTestSuite('Zend_Feed_Entry_RssTest');
+
+        /* Zend_Feed_Reader tests */
+        // Base parent class
+        $suite->addTestSuite('Zend_Feed_ReaderTest');
+        // RSS - Feed Level
+        $suite->addTestSuite('Zend_Feed_Reader_Feed_RssTest');
+        // RSS - Item Level
+        $suite->addTestSuite('Zend_Feed_Reader_Entry_RssTest');
+        // ATOM - Feed Level
+        $suite->addTestSuite('Zend_Feed_Reader_Feed_AtomTest');
+        // ATOM - Item Level
+        $suite->addTestSuite('Zend_Feed_Reader_Entry_AtomTest');
+        // COMMON - Feed Level
+        $suite->addTestSuite('Zend_Feed_Reader_Feed_CommonTest');
+        // COMMON - Entry Level
+        $suite->addTestSuite('Zend_Feed_Reader_Entry_CommonTest');
+        // ATOM - Entry Level (Source Feed Metadata)
+        $suite->addTestSuite('Zend_Feed_Reader_Feed_AtomSourceTest');
+        // ATOM - Entry Level (Standalone Entry Documents)
+        $suite->addTestSuite('Zend_Feed_Reader_Entry_AtomStandaloneEntryTest');
+        /**
+         * Real World Feed Tests
+         */
+        $suite->addTestSuite('Zend_Feed_Reader_Integration_WordpressRss2DcAtomTest');
+        $suite->addTestSuite('Zend_Feed_Reader_Integration_WordpressAtom10Test');
+        $suite->addTestSuite('Zend_Feed_Reader_Integration_LautDeRdfTest');
+        $suite->addTestSuite('Zend_Feed_Reader_Integration_HOnlineComAtom10Test');
+        
+        $suite->addTestSuite('Zend_Feed_Writer_FeedTest');
+        $suite->addTestSuite('Zend_Feed_Writer_EntryTest');
+        $suite->addTestSuite('Zend_Feed_Writer_DeletedTest');
+        $suite->addTestSuite('Zend_Feed_Writer_Renderer_Feed_AtomTest');
+        $suite->addTestSuite('Zend_Feed_Writer_Renderer_Feed_RssTest');
+        $suite->addTestSuite('Zend_Feed_Writer_Renderer_Entry_AtomTest');
+        $suite->addTestSuite('Zend_Feed_Writer_Renderer_Entry_RssTest');
+        
+        $suite->addTestSuite('Zend_Feed_Writer_Extension_ITunes_EntryTest');
+        $suite->addTestSuite('Zend_Feed_Writer_Extension_ITunes_FeedTest');
+        
+        $suite->addTest(Zend_Feed_Pubsubhubbub_AllTests::suite());
+
+        return $suite;
+    }
+}
+
+if (PHPUnit_MAIN_METHOD == 'Zend_Feed_AllTests::main') {
+    Zend_Feed_AllTests::main();
+}
+
+--------------------------------------https://searchcode.com/codesearch/view/108299748/--------------------------------------
+<?php
+/**
+ * Zend Framework
+ *
+ * LICENSE
+ *
+ * This source file is subject to the new BSD license that is bundled
+ * with this package in the file LICENSE.txt.
+ * It is also available through the world-wide-web at this URL:
+ * http://framework.zend.com/license/new-bsd
+ * If you did not receive a copy of the license and are unable to
+ * obtain it through the world-wide-web, please send an email
+ * to license@zend.com so we can send you a copy immediately.
+ *
+ * @category   Zend
+ * @package    Zend_Dojo
+ * @subpackage UnitTests
+ * @copyright  Copyright (c) 2005-2010 Zend Technologies USA Inc. (http://www.zend.com)
+ * @license    http://framework.zend.com/license/new-bsd     New BSD License
+ * @version    $Id$
+ */
+
+require_once dirname(dirname(dirname(dirname(dirname(__FILE__))))) . DIRECTORY_SEPARATOR . 'TestHelper.php';
+
+if (!defined('PHPUnit_MAIN_METHOD')) {
+    define('PHPUnit_MAIN_METHOD', 'Zend_Dojo_View_Helper_AllTests::main');
+}
+
+require_once 'Zend/Dojo/View/Helper/DojoTest.php';
+require_once 'Zend/Dojo/View/Helper/AccordionContainerTest.php';
+require_once 'Zend/Dojo/View/Helper/AccordionPaneTest.php';
+require_once 'Zend/Dojo/View/Helper/BorderContainerTest.php';
+require_once 'Zend/Dojo/View/Helper/ButtonTest.php';
+require_once 'Zend/Dojo/View/Helper/CheckBoxTest.php';
+require_once 'Zend/Dojo/View/Helper/ComboBoxTest.php';
+require_once 'Zend/Dojo/View/Helper/ContentPaneTest.php';
+require_once 'Zend/Dojo/View/Helper/CurrencyTextBoxTest.php';
+require_once 'Zend/Dojo/View/Helper/CustomDijitTest.php';
+require_once 'Zend/Dojo/View/Helper/DateTextBoxTest.php';
+require_once 'Zend/Dojo/View/Helper/FilteringSelectTest.php';
+require_once 'Zend/Dojo/View/Helper/FormTest.php';
+require_once 'Zend/Dojo/View/Helper/HorizontalSliderTest.php';
+require_once 'Zend/Dojo/View/Helper/NumberSpinnerTest.php';
+require_once 'Zend/Dojo/View/Helper/NumberTextBoxTest.php';
+require_once 'Zend/Dojo/View/Helper/PasswordTextBoxTest.php';
+require_once 'Zend/Dojo/View/Helper/RadioButtonTest.php';
+require_once 'Zend/Dojo/View/Helper/SimpleTextareaTest.php';
+require_once 'Zend/Dojo/View/Helper/SubmitButtonTest.php';
+require_once 'Zend/Dojo/View/Helper/SplitContainerTest.php';
+require_once 'Zend/Dojo/View/Helper/StackContainerTest.php';
+require_once 'Zend/Dojo/View/Helper/TabContainerTest.php';
+require_once 'Zend/Dojo/View/Helper/TextareaTest.php';
+require_once 'Zend/Dojo/View/Helper/TextBoxTest.php';
+require_once 'Zend/Dojo/View/Helper/TimeTextBoxTest.php';
+require_once 'Zend/Dojo/View/Helper/ValidationTextBoxTest.php';
+require_once 'Zend/Dojo/View/Helper/VerticalSliderTest.php';
+
+/**
+ * @category   Zend
+ * @package    Zend_Dojo
+ * @subpackage UnitTests
+ * @copyright  Copyright (c) 2005-2010 Zend Technologies USA Inc. (http://www.zend.com)
+ * @license    http://framework.zend.com/license/new-bsd     New BSD License
+ * @group      Zend_Dojo
+ * @group      Zend_Dojo_View
+ */
+class Zend_Dojo_View_Helper_AllTests
+{
+    public static function main()
+    {
+        PHPUnit_TextUI_TestRunner::run(self::suite());
+    }
+
+    public static function suite()
+    {
+        $suite = new PHPUnit_Framework_TestSuite('Zend Framework - Zend_Dojo_View_Helper');
+
+        $suite->addTestSuite('Zend_Dojo_View_Helper_DojoTest');
+        $suite->addTestSuite('Zend_Dojo_View_Helper_AccordionContainerTest');
+        $suite->addTestSuite('Zend_Dojo_View_Helper_AccordionPaneTest');
+        $suite->addTestSuite('Zend_Dojo_View_Helper_BorderContainerTest');
+        $suite->addTestSuite('Zend_Dojo_View_Helper_ButtonTest');
+        $suite->addTestSuite('Zend_Dojo_View_Helper_CheckBoxTest');
+        $suite->addTestSuite('Zend_Dojo_View_Helper_ComboBoxTest');
+        $suite->addTestSuite('Zend_Dojo_View_Helper_ContentPaneTest');
+        $suite->addTestSuite('Zend_Dojo_View_Helper_CurrencyTextBoxTest');
+        $suite->addTestSuite('Zend_Dojo_View_Helper_CustomDijitTest');
+        $suite->addTestSuite('Zend_Dojo_View_Helper_DateTextBoxTest');
+        $suite->addTestSuite('Zend_Dojo_View_Helper_FilteringSelectTest');
+        $suite->addTestSuite('Zend_Dojo_View_Helper_FormTest');
+        $suite->addTestSuite('Zend_Dojo_View_Helper_HorizontalSliderTest');
+        $suite->addTestSuite('Zend_Dojo_View_Helper_NumberSpinnerTest');
+        $suite->addTestSuite('Zend_Dojo_View_Helper_NumberTextBoxTest');
+        $suite->addTestSuite('Zend_Dojo_View_Helper_PasswordTextBoxTest');
+        $suite->addTestSuite('Zend_Dojo_View_Helper_RadioButtonTest');
+        $suite->addTestSuite('Zend_Dojo_View_Helper_SimpleTextareaTest');
+        $suite->addTestSuite('Zend_Dojo_View_Helper_SubmitButtonTest');
+        $suite->addTestSuite('Zend_Dojo_View_Helper_SplitContainerTest');
+        $suite->addTestSuite('Zend_Dojo_View_Helper_StackContainerTest');
+        $suite->addTestSuite('Zend_Dojo_View_Helper_TabContainerTest');
+        $suite->addTestSuite('Zend_Dojo_View_Helper_TextareaTest');
+        $suite->addTestSuite('Zend_Dojo_View_Helper_TextBoxTest');
+        $suite->addTestSuite('Zend_Dojo_View_Helper_TimeTextBoxTest');
+        $suite->addTestSuite('Zend_Dojo_View_Helper_ValidationTextBoxTest');
+        $suite->addTestSuite('Zend_Dojo_View_Helper_VerticalSliderTest');
+
+        return $suite;
+    }
+}
+
+if (PHPUnit_MAIN_METHOD == 'Zend_Dojo_View_Helper_AllTests::main') {
+    Zend_Dojo_View_Helper_AllTests::main();
+}
+
+--------------------------------------https://searchcode.com/codesearch/view/108303251/--------------------------------------
+<?php
+/**
+ * Zend Framework
+ *
+ * LICENSE
+ *
+ * This source file is subject to the new BSD license that is bundled
+ * with this package in the file LICENSE.txt.
+ * It is also available through the world-wide-web at this URL:
+ * http://framework.zend.com/license/new-bsd
+ * If you did not receive a copy of the license and are unable to
+ * obtain it through the world-wide-web, please send an email
+ * to license@zend.com so we can send you a copy immediately.
+ *
+ * @category   Zend
+ * @package    Zend_Validate
+ * @subpackage UnitTests
+ * @copyright  Copyright (c) 2005-2010 Zend Technologies USA Inc. (http://www.zend.com)
+ * @license    http://framework.zend.com/license/new-bsd     New BSD License
+ * @version    $Id$
+ */
+
+require_once dirname(dirname(dirname(__FILE__))) . DIRECTORY_SEPARATOR . 'TestHelper.php';
+
+if (!defined('PHPUnit_MAIN_METHOD')) {
+    define('PHPUnit_MAIN_METHOD', 'Zend_Validate_AllTests::main');
+}
+
+require_once 'Zend/Validate/AbstractTest.php';
+require_once 'Zend/Validate/AlnumTest.php';
+require_once 'Zend/Validate/AlphaTest.php';
+require_once 'Zend/Validate/BarcodeTest.php';
+require_once 'Zend/Validate/BetweenTest.php';
+require_once 'Zend/Validate/CcnumTest.php';
+require_once 'Zend/Validate/DateTest.php';
+require_once 'Zend/Validate/Db/AllTests.php';
+require_once 'Zend/Validate/DigitsTest.php';
+require_once 'Zend/Validate/EmailAddressTest.php';
+require_once 'Zend/Validate/File/AllTests.php';
+require_once 'Zend/Validate/FloatTest.php';
+require_once 'Zend/Validate/GreaterThanTest.php';
+require_once 'Zend/Validate/HexTest.php';
+require_once 'Zend/Validate/HostnameTest.php';
+require_once 'Zend/Validate/IdenticalTest.php';
+require_once 'Zend/Validate/InArrayTest.php';
+require_once 'Zend/Validate/IntTest.php';
+require_once 'Zend/Validate/IpTest.php';
+require_once 'Zend/Validate/IsbnTest.php';
+require_once 'Zend/Validate/LessThanTest.php';
+require_once 'Zend/Validate/MessageTest.php';
+require_once 'Zend/Validate/NotEmptyTest.php';
+require_once 'Zend/Validate/RegexTest.php';
+require_once 'Zend/Validate/Sitemap/AllTests.php';
+require_once 'Zend/Validate/StringLengthTest.php';
+
+/**
+ * @category   Zend
+ * @package    Zend_Validate
+ * @subpackage UnitTests
+ * @copyright  Copyright (c) 2005-2010 Zend Technologies USA Inc. (http://www.zend.com)
+ * @license    http://framework.zend.com/license/new-bsd     New BSD License
+ * @group      Zend_Validate
+ */
+class Zend_Validate_AllTests
+{
+    /**
+     * Runs this test suite
+     *
+     * @return void
+     */
+    public static function main()
+    {
+        PHPUnit_TextUI_TestRunner::run(self::suite());
+    }
+
+    /**
+     * Creates and returns this test suite
+     *
+     * @return PHPUnit_Framework_TestSuite
+     */
+    public static function suite()
+    {
+        $suite = new PHPUnit_Framework_TestSuite('Zend Framework - Zend_Validate');
+
+        $suite->addTestSuite('Zend_Validate_AbstractTest');
+        $suite->addTestSuite('Zend_Validate_AlnumTest');
+        $suite->addTestSuite('Zend_Validate_AlphaTest');
+        $suite->addTestSuite('Zend_Validate_BarcodeTest');
+        $suite->addTestSuite('Zend_Validate_BetweenTest');
+        $suite->addTestSuite('Zend_Validate_CcnumTest');
+        $suite->addTestSuite('Zend_Validate_DateTest');
+        $suite->addTest(Zend_Validate_Db_AllTests::suite());
+        $suite->addTestSuite('Zend_Validate_DigitsTest');
+        $suite->addTestSuite('Zend_Validate_EmailAddressTest');
+        $suite->addTest(Zend_Validate_File_AllTests::suite());
+        $suite->addTestSuite('Zend_Validate_FloatTest');
+        $suite->addTestSuite('Zend_Validate_GreaterThanTest');
+        $suite->addTestSuite('Zend_Validate_HexTest');
+        $suite->addTestSuite('Zend_Validate_HostnameTest');
+        $suite->addTestSuite('Zend_Validate_IdenticalTest');
+        $suite->addTestSuite('Zend_Validate_InArrayTest');
+        $suite->addTestSuite('Zend_Validate_IntTest');
+        $suite->addTestSuite('Zend_Validate_IpTest');
+        $suite->addTestSuite('Zend_Validate_IsbnTest');
+        $suite->addTestSuite('Zend_Validate_LessThanTest');
+        $suite->addTestSuite('Zend_Validate_MessageTest');
+        $suite->addTestSuite('Zend_Validate_NotEmptyTest');
+        $suite->addTestSuite('Zend_Validate_RegexTest');
+        $suite->addTest(Zend_Validate_Sitemap_AllTests::suite());
+        $suite->addTestSuite('Zend_Validate_StringLengthTest');
+
+        return $suite;
+    }
+}
+
+if (PHPUnit_MAIN_METHOD == 'Zend_Validate_AllTests::main') {
+    Zend_Validate_AllTests::main();
+}
+
+--------------------------------------https://searchcode.com/codesearch/view/108303575/--------------------------------------
+<?php
+/**
+ * Zend Framework
+ *
+ * LICENSE
+ *
+ * This source file is subject to the new BSD license that is bundled
+ * with this package in the file LICENSE.txt.
+ * It is also available through the world-wide-web at this URL:
+ * http://framework.zend.com/license/new-bsd
+ * If you did not receive a copy of the license and are unable to
+ * obtain it through the world-wide-web, please send an email
+ * to license@zend.com so we can send you a copy immediately.
+ *
+ * @category   Zend
+ * @package    Zend_Measure
+ * @subpackage UnitTests
+ * @copyright  Copyright (c) 2005-2010 Zend Technologies USA Inc. (http://www.zend.com)
+ * @license    http://framework.zend.com/license/new-bsd     New BSD License
+ * @version    $Id$
+ */
+
+require_once dirname(dirname(dirname(__FILE__))) . DIRECTORY_SEPARATOR . 'TestHelper.php';
+
+if (!defined('PHPUnit_MAIN_METHOD')) {
+    define('PHPUnit_MAIN_METHOD', 'Zend_Measure_AllTests::main');
+}
+
+// define('TESTS_ZEND_LOCALE_BCMATH_ENABLED', false); // uncomment to disable use of bcmath extension by Zend_Date
+
+require_once 'Zend/Measure/Cooking/VolumeTest.php';
+require_once 'Zend/Measure/Cooking/WeightTest.php';
+
+require_once 'Zend/Measure/Flow/MassTest.php';
+require_once 'Zend/Measure/Flow/MoleTest.php';
+require_once 'Zend/Measure/Flow/VolumeTest.php';
+
+require_once 'Zend/Measure/Viscosity/DynamicTest.php';
+require_once 'Zend/Measure/Viscosity/KinematicTest.php';
+require_once 'Zend/Measure/AccelerationTest.php';
+require_once 'Zend/Measure/AngleTest.php';
+require_once 'Zend/Measure/AreaTest.php';
+require_once 'Zend/Measure/BinaryTest.php';
+require_once 'Zend/Measure/CapacitanceTest.php';
+require_once 'Zend/Measure/CurrentTest.php';
+require_once 'Zend/Measure/DensityTest.php';
+require_once 'Zend/Measure/EnergyTest.php';
+require_once 'Zend/Measure/ForceTest.php';
+require_once 'Zend/Measure/FrequencyTest.php';
+require_once 'Zend/Measure/IlluminationTest.php';
+require_once 'Zend/Measure/LengthTest.php';
+require_once 'Zend/Measure/LightnessTest.php';
+require_once 'Zend/Measure/NumberTest.php';
+require_once 'Zend/Measure/PowerTest.php';
+require_once 'Zend/Measure/PressureTest.php';
+require_once 'Zend/Measure/SpeedTest.php';
+require_once 'Zend/Measure/TemperatureTest.php';
+require_once 'Zend/Measure/TimeTest.php';
+require_once 'Zend/Measure/TorqueTest.php';
+require_once 'Zend/Measure/VolumeTest.php';
+require_once 'Zend/Measure/WeightTest.php';
+
+// echo "BCMATH is ", Zend_Locale_Math::isBcmathDisabled() ? 'disabled':'not disabled', "\n";
+
+/**
+ * @category   Zend
+ * @package    Zend_Measuree
+ * @subpackage UnitTests
+ * @copyright  Copyright (c) 2005-2010 Zend Technologies USA Inc. (http://www.zend.com)
+ * @license    http://framework.zend.com/license/new-bsd     New BSD License
+ * @group      Zend_Measure
+ */
+class Zend_Measure_AllTests
+{
+    public static function main()
+    {
+        PHPUnit_TextUI_TestRunner::run(self::suite());
+    }
+
+    public static function suite()
+    {
+        $suite = new PHPUnit_Framework_TestSuite('Zend Framework - Zend_Measure');
+
+        $suite->addTestSuite('Zend_Measure_Cooking_VolumeTest');
+        $suite->addTestSuite('Zend_Measure_Cooking_WeightTest');
+
+        $suite->addTestSuite('Zend_Measure_Flow_MassTest');
+        $suite->addTestSuite('Zend_Measure_Flow_MoleTest');
+        $suite->addTestSuite('Zend_Measure_Flow_VolumeTest');
+
+        $suite->addTestSuite('Zend_Measure_Viscosity_DynamicTest');
+        $suite->addTestSuite('Zend_Measure_Viscosity_KinematicTest');
+
+        $suite->addTestSuite('Zend_Measure_AccelerationTest');
+        $suite->addTestSuite('Zend_Measure_AngleTest');
+        $suite->addTestSuite('Zend_Measure_AreaTest');
+        $suite->addTestSuite('Zend_Measure_BinaryTest');
+        $suite->addTestSuite('Zend_Measure_CapacitanceTest');
+        $suite->addTestSuite('Zend_Measure_CurrentTest');
+        $suite->addTestSuite('Zend_Measure_DensityTest');
+        $suite->addTestSuite('Zend_Measure_EnergyTest');
+        $suite->addTestSuite('Zend_Measure_ForceTest');
+        $suite->addTestSuite('Zend_Measure_FrequencyTest');
+        $suite->addTestSuite('Zend_Measure_IlluminationTest');
+        $suite->addTestSuite('Zend_Measure_LengthTest');
+        $suite->addTestSuite('Zend_Measure_LightnessTest');
+        $suite->addTestSuite('Zend_Measure_NumberTest');
+        $suite->addTestSuite('Zend_Measure_PowerTest');
+        $suite->addTestSuite('Zend_Measure_PressureTest');
+        $suite->addTestSuite('Zend_Measure_SpeedTest');
+        $suite->addTestSuite('Zend_Measure_TemperatureTest');
+        $suite->addTestSuite('Zend_Measure_TimeTest');
+        $suite->addTestSuite('Zend_Measure_TorqueTest');
+        $suite->addTestSuite('Zend_Measure_VolumeTest');
+        $suite->addTestSuite('Zend_Measure_WeightTest');
+
+        return $suite;
+    }
+}
+
+if (PHPUnit_MAIN_METHOD == 'Zend_Measure_AllTests::main') {
+    Zend_Measure_AllTests::main();
+}
+
+--------------------------------------https://searchcode.com/codesearch/view/108304179/--------------------------------------
+<?php
+/**
+ * Zend Framework
+ *
+ * LICENSE
+ *
+ * This source file is subject to the new BSD license that is bundled
+ * with this package in the file LICENSE.txt.
+ * It is also available through the world-wide-web at this URL:
+ * http://framework.zend.com/license/new-bsd
+ * If you did not receive a copy of the license and are unable to
+ * obtain it through the world-wide-web, please send an email
+ * to license@zend.com so we can send you a copy immediately.
+ *
+ * @category   Zend
+ * @package    Zend_Db
+ * @subpackage Table
+ * @copyright  Copyright (c) 2005-2010 Zend Technologies USA Inc. (http://www.zend.com)
+ * @license    http://framework.zend.com/license/new-bsd     New BSD License
+ * @version    $Id$
+ */
+
+/**
+ * @see Zend_Db
+ */
+require_once 'Zend/Db.php';
+
+/**
+ * @category   Zend
+ * @package    Zend_Db
+ * @subpackage Table
+ * @copyright  Copyright (c) 2005-2010 Zend Technologies USA Inc. (http://www.zend.com)
+ * @license    http://framework.zend.com/license/new-bsd     New BSD License
+ */
+abstract class Zend_Db_Table_Row_Abstract implements ArrayAccess
+{
+
+    /**
+     * The data for each column in the row (column_name => value).
+     * The keys must match the physical names of columns in the
+     * table for which this row is defined.
+     *
+     * @var array
+     */
+    protected $_data = array();
+
+    /**
+     * This is set to a copy of $_data when the data is fetched from
+     * a database, specified as a new tuple in the constructor, or
+     * when dirty data is posted to the database with save().
+     *
+     * @var array
+     */
+    protected $_cleanData = array();
+
+    /**
+     * Tracks columns where data has been updated. Allows more specific insert and
+     * update operations.
+     *
+     * @var array
+     */
+    protected $_modifiedFields = array();
+
+    /**
+     * Zend_Db_Table_Abstract parent class or instance.
+     *
+     * @var Zend_Db_Table_Abstract
+     */
+    protected $_table = null;
+
+    /**
+     * Connected is true if we have a reference to a live
+     * Zend_Db_Table_Abstract object.
+     * This is false after the Rowset has been deserialized.
+     *
+     * @var boolean
+     */
+    protected $_connected = true;
+
+    /**
+     * A row is marked read only if it contains columns that are not physically represented within
+     * the database schema (e.g. evaluated columns/Zend_Db_Expr columns). This can also be passed
+     * as a run-time config options as a means of protecting row data.
+     *
+     * @var boolean
+     */
+    protected $_readOnly = false;
+
+    /**
+     * Name of the class of the Zend_Db_Table_Abstract object.
+     *
+     * @var string
+     */
+    protected $_tableClass = null;
+
+    /**
+     * Primary row key(s).
+     *
+     * @var array
+     */
+    protected $_primary;
+
+    /**
+     * Constructor.
+     *
+     * Supported params for $config are:-
+     * - table       = class name or object of type Zend_Db_Table_Abstract
+     * - data        = values of columns in this row.
+     *
+     * @param  array $config OPTIONAL Array of user-specified config options.
+     * @return void
+     * @throws Zend_Db_Table_Row_Exception
+     */
+    public function __construct(array $config = array())
+    {
+        if (isset($config['table']) && $config['table'] instanceof Zend_Db_Table_Abstract) {
+            $this->_table = $config['table'];
+            $this->_tableClass = get_class($this->_table);
+        } elseif ($this->_tableClass !== null) {
+            $this->_table = $this->_getTableFromString($this->_tableClass);
+        }
+
+        if (isset($config['data'])) {
+            if (!is_array($config['data'])) {
+                require_once 'Zend/Db/Table/Row/Exception.php';
+                throw new Zend_Db_Table_Row_Exception('Data must be an array');
+            }
+            $this->_data = $config['data'];
+        }
+        if (isset($config['stored']) && $config['stored'] === true) {
+            $this->_cleanData = $this->_data;
+        }
+
+        if (isset($config['readOnly']) && $config['readOnly'] === true) {
+            $this->setReadOnly(true);
+        }
+
+        // Retrieve primary keys from table schema
+        if (($table = $this->_getTable())) {
+            $info = $table->info();
+            $this->_primary = (array) $info['primary'];
+        }
+
+        $this->init();
+    }
+
+    /**
+     * Transform a column name from the user-specified form
+     * to the physical form used in the database.
+     * You can override this method in a custom Row class
+     * to implement column name mappings, for example inflection.
+     *
+     * @param string $columnName Column name given.
+     * @return string The column name after transformation applied (none by default).
+     * @throws Zend_Db_Table_Row_Exception if the $columnName is not a string.
+     */
+    protected function _transformColumn($columnName)
+    {
+        if (!is_string($columnName)) {
+            require_once 'Zend/Db/Table/Row/Exception.php';
+            throw new Zend_Db_Table_Row_Exception('Specified column is not a string');
+        }
+        // Perform no transformation by default
+        return $columnName;
+    }
+
+    /**
+     * Retrieve row field value
+     *
+     * @param  string $columnName The user-specified column name.
+     * @return string             The corresponding column value.
+     * @throws Zend_Db_Table_Row_Exception if the $columnName is not a column in the row.
+     */
+    public function __get($columnName)
+    {
+        $columnName = $this->_transformColumn($columnName);
+        if (!array_key_exists($columnName, $this->_data)) {
+            require_once 'Zend/Db/Table/Row/Exception.php';
+            throw new Zend_Db_Table_Row_Exception("Specified column \"$columnName\" is not in the row");
+        }
+        return $this->_data[$columnName];
+    }
+
+    /**
+     * Set row field value
+     *
+     * @param  string $columnName The column key.
+     * @param  mixed  $value      The value for the property.
+     * @return void
+     * @throws Zend_Db_Table_Row_Exception
+     */
+    public function __set($columnName, $value)
+    {
+        $columnName = $this->_transformColumn($columnName);
+        if (!array_key_exists($columnName, $this->_data)) {
+            require_once 'Zend/Db/Table/Row/Exception.php';
+            throw new Zend_Db_Table_Row_Exception("Specified column \"$columnName\" is not in the row");
+        }
+        $this->_data[$columnName] = $value;
+        $this->_modifiedFields[$columnName] = true;
+    }
+
+    /**
+     * Unset row field value
+     *
+     * @param  string $columnName The column key.
+     * @return Zend_Db_Table_Row_Abstract
+     * @throws Zend_Db_Table_Row_Exception
+     */
+    public function __unset($columnName)
+    {
+        $columnName = $this->_transformColumn($columnName);
+        if (!array_key_exists($columnName, $this->_data)) {
+            require_once 'Zend/Db/Table/Row/Exception.php';
+            throw new Zend_Db_Table_Row_Exception("Specified column \"$columnName\" is not in the row");
+        }
+        if ($this->isConnected() && in_array($columnName, $this->_table->info('primary'))) {
+            require_once 'Zend/Db/Table/Row/Exception.php';
+            throw new Zend_Db_Table_Row_Exception("Specified column \"$columnName\" is a primary key and should not be unset");
+        }
+        unset($this->_data[$columnName]);
+        return $this;
+    }
+
+    /**
+     * Test existence of row field
+     *
+     * @param  string  $columnName   The column key.
+     * @return boolean
+     */
+    public function __isset($columnName)
+    {
+        $columnName = $this->_transformColumn($columnName);
+        return array_key_exists($columnName, $this->_data);
+    }
+
+    /**
+     * Store table, primary key and data in serialized object
+     *
+     * @return array
+     */
+    public function __sleep()
+    {
+        return array('_tableClass', '_primary', '_data', '_cleanData', '_readOnly' ,'_modifiedFields');
+    }
+
+    /**
+     * Setup to do on wakeup.
+     * A de-serialized Row should not be assumed to have access to a live
+     * database connection, so set _connected = false.
+     *
+     * @return void
+     */
+    public function __wakeup()
+    {
+        $this->_connected = false;
+    }
+
+    /**
+     * Proxy to __isset
+     * Required by the ArrayAccess implementation
+     *
+     * @param string $offset
+     * @return boolean
+     */
+    public function offsetExists($offset)
+    {
+        return $this->__isset($offset);
+    }
+
+    /**
+     * Proxy to __get
+     * Required by the ArrayAccess implementation
+     *
+     * @param string $offset
+     * @return string
+     */
+     public function offsetGet($offset)
+     {
+         return $this->__get($offset);
+     }
+
+     /**
+      * Proxy to __set
+      * Required by the ArrayAccess implementation
+      *
+      * @param string $offset
+      * @param mixed $value
+      */
+     public function offsetSet($offset, $value)
+     {
+         $this->__set($offset, $value);
+     }
+
+     /**
+      * Proxy to __unset
+      * Required by the ArrayAccess implementation
+      *
+      * @param string $offset
+      */
+     public function offsetUnset($offset)
+     {
+         return $this->__unset($offset);
+     }
+
+    /**
+     * Initialize object
+     *
+     * Called from {@link __construct()} as final step of object instantiation.
+     *
+     * @return void
+     */
+    public function init()
+    {
+    }
+
+    /**
+     * Returns the table object, or null if this is disconnected row
+     *
+     * @return Zend_Db_Table_Abstract|null
+     */
+    public function getTable()
+    {
+        return $this->_table;
+    }
+
+    /**
+     * Set the table object, to re-establish a live connection
+     * to the database for a Row that has been de-serialized.
+     *
+     * @param Zend_Db_Table_Abstract $table
+     * @return boolean
+     * @throws Zend_Db_Table_Row_Exception
+     */
+    public function setTable(Zend_Db_Table_Abstract $table = null)
+    {
+        if ($table == null) {
+            $this->_table = null;
+            $this->_connected = false;
+            return false;
+        }
+
+        $tableClass = get_class($table);
+        if (! $table instanceof $this->_tableClass) {
+            require_once 'Zend/Db/Table/Row/Exception.php';
+            throw new Zend_Db_Table_Row_Exception("The specified Table is of class $tableClass, expecting class to be instance of $this->_tableClass");
+        }
+
+        $this->_table = $table;
+        $this->_tableClass = $tableClass;
+
+        $info = $this->_table->info();
+
+        if ($info['cols'] != array_keys($this->_data)) {
+            require_once 'Zend/Db/Table/Row/Exception.php';
+            throw new Zend_Db_Table_Row_Exception('The specified Table does not have the same columns as the Row');
+        }
+
+        if (! array_intersect((array) $this->_primary, $info['primary']) == (array) $this->_primary) {
+
+            require_once 'Zend/Db/Table/Row/Exception.php';
+            throw new Zend_Db_Table_Row_Exception("The specified Table '$tableClass' does not have the same primary key as the Row");
+        }
+
+        $this->_connected = true;
+        return true;
+    }
+
+    /**
+     * Query the class name of the Table object for which this
+     * Row was created.
+     *
+     * @return string
+     */
+    public function getTableClass()
+    {
+        return $this->_tableClass;
+    }
+
+    /**
+     * Test the connected status of the row.
+     *
+     * @return boolean
+     */
+    public function isConnected()
+    {
+        return $this->_connected;
+    }
+
+    /**
+     * Test the read-only status of the row.
+     *
+     * @return boolean
+     */
+    public function isReadOnly()
+    {
+        return $this->_readOnly;
+    }
+
+    /**
+     * Set the read-only status of the row.
+     *
+     * @param boolean $flag
+     * @return boolean
+     */
+    public function setReadOnly($flag)
+    {
+        $this->_readOnly = (bool) $flag;
+    }
+
+    /**
+     * Returns an instance of the parent table's Zend_Db_Table_Select object.
+     *
+     * @return Zend_Db_Table_Select
+     */
+    public function select()
+    {
+        return $this->getTable()->select();
+    }
+
+    /**
+     * Saves the properties to the database.
+     *
+     * This performs an intelligent insert/update, and reloads the
+     * properties with fresh data from the table on success.
+     *
+     * @return mixed The primary key value(s), as an associative array if the
+     *     key is compound, or a scalar if the key is single-column.
+     */
+    public function save()
+    {
+        /**
+         * If the _cleanData array is empty,
+         * this is an INSERT of a new row.
+         * Otherwise it is an UPDATE.
+         */
+        if (empty($this->_cleanData)) {
+            return $this->_doInsert();
+        } else {
+            return $this->_doUpdate();
+        }
+    }
+
+    /**
+     * @return mixed The primary key value(s), as an associative array if the
+     *     key is compound, or a scalar if the key is single-column.
+     */
+    protected function _doInsert()
+    {
+        /**
+         * A read-only row cannot be saved.
+         */
+        if ($this->_readOnly === true) {
+            require_once 'Zend/Db/Table/Row/Exception.php';
+            throw new Zend_Db_Table_Row_Exception('This row has been marked read-only');
+        }
+
+        /**
+         * Run pre-INSERT logic
+         */
+        $this->_insert();
+
+        /**
+         * Execute the INSERT (this may throw an exception)
+         */
+        $data = array_intersect_key($this->_data, $this->_modifiedFields);
+        $primaryKey = $this->_getTable()->insert($data);
+
+        /**
+         * Normalize the result to an array indexed by primary key column(s).
+         * The table insert() method may return a scalar.
+         */
+        if (is_array($primaryKey)) {
+            $newPrimaryKey = $primaryKey;
+        } else {
+            //ZF-6167 Use tempPrimaryKey temporary to avoid that zend encoding fails.
+            $tempPrimaryKey = (array) $this->_primary;
+            $newPrimaryKey = array(current($tempPrimaryKey) => $primaryKey);
+        }
+
+        /**
+         * Save the new primary key value in _data.  The primary key may have
+         * been generated by a sequence or auto-increment mechanism, and this
+         * merge should be done before the _postInsert() method is run, so the
+         * new values are available for logging, etc.
+         */
+        $this->_data = array_merge($this->_data, $newPrimaryKey);
+
+        /**
+         * Run post-INSERT logic
+         */
+        $this->_postInsert();
+
+        /**
+         * Update the _cleanData to reflect that the data has been inserted.
+         */
+        $this->_refresh();
+
+        return $primaryKey;
+    }
+
+    /**
+     * @return mixed The primary key value(s), as an associative array if the
+     *     key is compound, or a scalar if the key is single-column.
+     */
+    protected function _doUpdate()
+    {
+        /**
+         * A read-only row cannot be saved.
+         */
+        if ($this->_readOnly === true) {
+            require_once 'Zend/Db/Table/Row/Exception.php';
+            throw new Zend_Db_Table_Row_Exception('This row has been marked read-only');
+        }
+
+        /**
+         * Get expressions for a WHERE clause
+         * based on the primary key value(s).
+         */
+        $where = $this->_getWhereQuery(false);
+
+        /**
+         * Run pre-UPDATE logic
+         */
+        $this->_update();
+
+        /**
+         * Compare the data to the modified fields array to discover
+         * which columns have been changed.
+         */
+        $diffData = array_intersect_key($this->_data, $this->_modifiedFields);
+
+        /**
+         * Were any of the changed columns part of the primary key?
+         */
+        $pkDiffData = array_intersect_key($diffData, array_flip((array)$this->_primary));
+
+        /**
+         * Execute cascading updates against dependent tables.
+         * Do this only if primary key value(s) were changed.
+         */
+        if (count($pkDiffData) > 0) {
+            $depTables = $this->_getTable()->getDependentTables();
+            if (!empty($depTables)) {
+                $pkNew = $this->_getPrimaryKey(true);
+                $pkOld = $this->_getPrimaryKey(false);
+                foreach ($depTables as $tableClass) {
+                    $t = $this->_getTableFromString($tableClass);
+                    $t->_cascadeUpdate($this->getTableClass(), $pkOld, $pkNew);
+                }
+            }
+        }
+
+        /**
+         * Execute the UPDATE (this may throw an exception)
+         * Do this only if data values were changed.
+         * Use the $diffData variable, so the UPDATE statement
+         * includes SET terms only for data values that changed.
+         */
+        if (count($diffData) > 0) {
+            $this->_getTable()->update($diffData, $where);
+        }
+
+        /**
+         * Run post-UPDATE logic.  Do this before the _refresh()
+         * so the _postUpdate() function can tell the difference
+         * between changed data and clean (pre-changed) data.
+         */
+        $this->_postUpdate();
+
+        /**
+         * Refresh the data just in case triggers in the RDBMS changed
+         * any columns.  Also this resets the _cleanData.
+         */
+        $this->_refresh();
+
+        /**
+         * Return the primary key value(s) as an array
+         * if the key is compound or a scalar if the key
+         * is a scalar.
+         */
+        $primaryKey = $this->_getPrimaryKey(true);
+        if (count($primaryKey) == 1) {
+            return current($primaryKey);
+        }
+
+        return $primaryKey;
+    }
+
+    /**
+     * Deletes existing rows.
+     *
+     * @return int The number of rows deleted.
+     */
+    public function delete()
+    {
+        /**
+         * A read-only row cannot be deleted.
+         */
+        if ($this->_readOnly === true) {
+            require_once 'Zend/Db/Table/Row/Exception.php';
+            throw new Zend_Db_Table_Row_Exception('This row has been marked read-only');
+        }
+
+        $where = $this->_getWhereQuery();
+
+        /**
+         * Execute pre-DELETE logic
+         */
+        $this->_delete();
+
+        /**
+         * Execute cascading deletes against dependent tables
+         */
+        $depTables = $this->_getTable()->getDependentTables();
+        if (!empty($depTables)) {
+            $pk = $this->_getPrimaryKey();
+            foreach ($depTables as $tableClass) {
+                $t = $this->_getTableFromString($tableClass);
+                $t->_cascadeDelete($this->getTableClass(), $pk);
+            }
+        }
+
+        /**
+         * Execute the DELETE (this may throw an exception)
+         */
+        $result = $this->_getTable()->delete($where);
+
+        /**
+         * Execute post-DELETE logic
+         */
+        $this->_postDelete();
+
+        /**
+         * Reset all fields to null to indicate that the row is not there
+         */
+        $this->_data = array_combine(
+            array_keys($this->_data),
+            array_fill(0, count($this->_data), null)
+        );
+
+        return $result;
+    }
+
+    /**
+     * Returns the column/value data as an array.
+     *
+     * @return array
+     */
+    public function toArray()
+    {
+        return (array)$this->_data;
+    }
+
+    /**
+     * Sets all data in the row from an array.
+     *
+     * @param  array $data
+     * @return Zend_Db_Table_Row_Abstract Provides a fluent interface
+     */
+    public function setFromArray(array $data)
+    {
+        $data = array_intersect_key($data, $this->_data);
+
+        foreach ($data as $columnName => $value) {
+            $this->__set($columnName, $value);
+        }
+
+        return $this;
+    }
+
+    /**
+     * Refreshes properties from the database.
+     *
+     * @return void
+     */
+    public function refresh()
+    {
+        return $this->_refresh();
+    }
+
+    /**
+     * Retrieves an instance of the parent table.
+     *
+     * @return Zend_Db_Table_Abstract
+     */
+    protected function _getTable()
+    {
+        if (!$this->_connected) {
+            require_once 'Zend/Db/Table/Row/Exception.php';
+            throw new Zend_Db_Table_Row_Exception('Cannot save a Row unless it is connected');
+        }
+        return $this->_table;
+    }
+
+    /**
+     * Retrieves an associative array of primary keys.
+     *
+     * @param bool $useDirty
+     * @return array
+     */
+    protected function _getPrimaryKey($useDirty = true)
+    {
+        if (!is_array($this->_primary)) {
+            require_once 'Zend/Db/Table/Row/Exception.php';
+            throw new Zend_Db_Table_Row_Exception("The primary key must be set as an array");
+        }
+
+        $primary = array_flip($this->_primary);
+        if ($useDirty) {
+            $array = array_intersect_key($this->_data, $primary);
+        } else {
+            $array = array_intersect_key($this->_cleanData, $primary);
+        }
+        if (count($primary) != count($array)) {
+            require_once 'Zend/Db/Table/Row/Exception.php';
+            throw new Zend_Db_Table_Row_Exception("The specified Table '$this->_tableClass' does not have the same primary key as the Row");
+        }
+        return $array;
+    }
+
+    /**
+     * Constructs where statement for retrieving row(s).
+     *
+     * @param bool $useDirty
+     * @return array
+     */
+    protected function _getWhereQuery($useDirty = true)
+    {
+        $where = array();
+        $db = $this->_getTable()->getAdapter();
+        $primaryKey = $this->_getPrimaryKey($useDirty);
+        $info = $this->_getTable()->info();
+        $metadata = $info[Zend_Db_Table_Abstract::METADATA];
+
+        // retrieve recently updated row using primary keys
+        $where = array();
+        foreach ($primaryKey as $column => $value) {
+            $tableName = $db->quoteIdentifier($info[Zend_Db_Table_Abstract::NAME], true);
+            $type = $metadata[$column]['DATA_TYPE'];
+            $columnName = $db->quoteIdentifier($column, true);
+            $where[] = $db->quoteInto("{$tableName}.{$columnName} = ?", $value, $type);
+        }
+        return $where;
+    }
+
+    /**
+     * Refreshes properties from the database.
+     *
+     * @return void
+     */
+    protected function _refresh()
+    {
+        $where = $this->_getWhereQuery();
+        $row = $this->_getTable()->fetchRow($where);
+
+        if (null === $row) {
+            require_once 'Zend/Db/Table/Row/Exception.php';
+            throw new Zend_Db_Table_Row_Exception('Cannot refresh row as parent is missing');
+        }
+
+        $this->_data = $row->toArray();
+        $this->_cleanData = $this->_data;
+        $this->_modifiedFields = array();
+    }
+
+    /**
+     * Allows pre-insert logic to be applied to row.
+     * Subclasses may override this method.
+     *
+     * @return void
+     */
+    protected function _insert()
+    {
+    }
+
+    /**
+     * Allows post-insert logic to be applied to row.
+     * Subclasses may override this method.
+     *
+     * @return void
+     */
+    protected function _postInsert()
+    {
+    }
+
+    /**
+     * Allows pre-update logic to be applied to row.
+     * Subclasses may override this method.
+     *
+     * @return void
+     */
+    protected function _update()
+    {
+    }
+
+    /**
+     * Allows post-update logic to be applied to row.
+     * Subclasses may override this method.
+     *
+     * @return void
+     */
+    protected function _postUpdate()
+    {
+    }
+
+    /**
+     * Allows pre-delete logic to be applied to row.
+     * Subclasses may override this method.
+     *
+     * @return void
+     */
+    protected function _delete()
+    {
+    }
+
+    /**
+     * Allows post-delete logic to be applied to row.
+     * Subclasses may override this method.
+     *
+     * @return void
+     */
+    protected function _postDelete()
+    {
+    }
+
+    /**
+     * Prepares a table reference for lookup.
+     *
+     * Ensures all reference keys are set and properly formatted.
+     *
+     * @param Zend_Db_Table_Abstract $dependentTable
+     * @param Zend_Db_Table_Abstract $parentTable
+     * @param string                 $ruleKey
+     * @return array
+     */
+    protected function _prepareReference(Zend_Db_Table_Abstract $dependentTable, Zend_Db_Table_Abstract $parentTable, $ruleKey)
+    {
+        $parentTableName = (get_class($parentTable) === 'Zend_Db_Table') ? $parentTable->getDefinitionConfigName() : get_class($parentTable);
+        $map = $dependentTable->getReference($parentTableName, $ruleKey);
+
+        if (!isset($map[Zend_Db_Table_Abstract::REF_COLUMNS])) {
+            $parentInfo = $parentTable->info();
+            $map[Zend_Db_Table_Abstract::REF_COLUMNS] = array_values((array) $parentInfo['primary']);
+        }
+
+        $map[Zend_Db_Table_Abstract::COLUMNS] = (array) $map[Zend_Db_Table_Abstract::COLUMNS];
+        $map[Zend_Db_Table_Abstract::REF_COLUMNS] = (array) $map[Zend_Db_Table_Abstract::REF_COLUMNS];
+
+        return $map;
+    }
+
+    /**
+     * Query a dependent table to retrieve rows matching the current row.
+     *
+     * @param string|Zend_Db_Table_Abstract  $dependentTable
+     * @param string                         OPTIONAL $ruleKey
+     * @param Zend_Db_Table_Select           OPTIONAL $select
+     * @return Zend_Db_Table_Rowset_Abstract Query result from $dependentTable
+     * @throws Zend_Db_Table_Row_Exception If $dependentTable is not a table or is not loadable.
+     */
+    public function findDependentRowset($dependentTable, $ruleKey = null, Zend_Db_Table_Select $select = null)
+    {
+        $db = $this->_getTable()->getAdapter();
+
+        if (is_string($dependentTable)) {
+            $dependentTable = $this->_getTableFromString($dependentTable);
+        }
+
+        if (!$dependentTable instanceof Zend_Db_Table_Abstract) {
+            $type = gettype($dependentTable);
+            if ($type == 'object') {
+                $type = get_class($dependentTable);
+            }
+            require_once 'Zend/Db/Table/Row/Exception.php';
+            throw new Zend_Db_Table_Row_Exception("Dependent table must be a Zend_Db_Table_Abstract, but it is $type");
+        }
+
+        // even if we are interacting between a table defined in a class and a
+        // table via extension, ensure to persist the definition
+        if (($tableDefinition = $this->_table->getDefinition()) !== null
+            && ($dependentTable->getDefinition() == null)) {
+            $dependentTable->setOptions(array(Zend_Db_Table_Abstract::DEFINITION => $tableDefinition));
+        }
+
+        if ($select === null) {
+            $select = $dependentTable->select();
+        } else {
+            $select->setTable($dependentTable);
+        }
+
+        $map = $this->_prepareReference($dependentTable, $this->_getTable(), $ruleKey);
+
+        for ($i = 0; $i < count($map[Zend_Db_Table_Abstract::COLUMNS]); ++$i) {
+            $parentColumnName = $db->foldCase($map[Zend_Db_Table_Abstract::REF_COLUMNS][$i]);
+            $value = $this->_data[$parentColumnName];
+            // Use adapter from dependent table to ensure correct query construction
+            $dependentDb = $dependentTable->getAdapter();
+            $dependentColumnName = $dependentDb->foldCase($map[Zend_Db_Table_Abstract::COLUMNS][$i]);
+            $dependentColumn = $dependentDb->quoteIdentifier($dependentColumnName, true);
+            $dependentInfo = $dependentTable->info();
+            $type = $dependentInfo[Zend_Db_Table_Abstract::METADATA][$dependentColumnName]['DATA_TYPE'];
+            $select->where("$dependentColumn = ?", $value, $type);
+        }
+
+        return $dependentTable->fetchAll($select);
+    }
+
+    /**
+     * Query a parent table to retrieve the single row matching the current row.
+     *
+     * @param string|Zend_Db_Table_Abstract $parentTable
+     * @param string                        OPTIONAL $ruleKey
+     * @param Zend_Db_Table_Select          OPTIONAL $select
+     * @return Zend_Db_Table_Row_Abstract   Query result from $parentTable
+     * @throws Zend_Db_Table_Row_Exception If $parentTable is not a table or is not loadable.
+     */
+    public function findParentRow($parentTable, $ruleKey = null, Zend_Db_Table_Select $select = null)
+    {
+        $db = $this->_getTable()->getAdapter();
+
+        if (is_string($parentTable)) {
+            $parentTable = $this->_getTableFromString($parentTable);
+        }
+
+        if (!$parentTable instanceof Zend_Db_Table_Abstract) {
+            $type = gettype($parentTable);
+            if ($type == 'object') {
+                $type = get_class($parentTable);
+            }
+            require_once 'Zend/Db/Table/Row/Exception.php';
+            throw new Zend_Db_Table_Row_Exception("Parent table must be a Zend_Db_Table_Abstract, but it is $type");
+        }
+
+        // even if we are interacting between a table defined in a class and a
+        // table via extension, ensure to persist the definition
+        if (($tableDefinition = $this->_table->getDefinition()) !== null
+            && ($parentTable->getDefinition() == null)) {
+            $parentTable->setOptions(array(Zend_Db_Table_Abstract::DEFINITION => $tableDefinition));
+        }
+
+        if ($select === null) {
+            $select = $parentTable->select();
+        } else {
+            $select->setTable($parentTable);
+        }
+
+        $map = $this->_prepareReference($this->_getTable(), $parentTable, $ruleKey);
+
+        // iterate the map, creating the proper wheres
+        for ($i = 0; $i < count($map[Zend_Db_Table_Abstract::COLUMNS]); ++$i) {
+            $dependentColumnName = $db->foldCase($map[Zend_Db_Table_Abstract::COLUMNS][$i]);
+            $value = $this->_data[$dependentColumnName];
+            // Use adapter from parent table to ensure correct query construction
+            $parentDb = $parentTable->getAdapter();
+            $parentColumnName = $parentDb->foldCase($map[Zend_Db_Table_Abstract::REF_COLUMNS][$i]);
+            $parentColumn = $parentDb->quoteIdentifier($parentColumnName, true);
+            $parentInfo = $parentTable->info();
+
+            // determine where part
+            $type     = $parentInfo[Zend_Db_Table_Abstract::METADATA][$parentColumnName]['DATA_TYPE'];
+            $nullable = $parentInfo[Zend_Db_Table_Abstract::METADATA][$parentColumnName]['NULLABLE'];
+            if ($value === null && $nullable == true) {
+                $select->where("$parentColumn IS NULL");
+            } elseif ($value === null && $nullable == false) {
+                return null;
+            } else {
+                $select->where("$parentColumn = ?", $value, $type);
+            }
+
+        }
+
+        return $parentTable->fetchRow($select);
+    }
+
+    /**
+     * @param  string|Zend_Db_Table_Abstract  $matchTable
+     * @param  string|Zend_Db_Table_Abstract  $intersectionTable
+     * @param  string                         OPTIONAL $callerRefRule
+     * @param  string                         OPTIONAL $matchRefRule
+     * @param  Zend_Db_Table_Select           OPTIONAL $select
+     * @return Zend_Db_Table_Rowset_Abstract Query result from $matchTable
+     * @throws Zend_Db_Table_Row_Exception If $matchTable or $intersectionTable is not a table class or is not loadable.
+     */
+    public function findManyToManyRowset($matchTable, $intersectionTable, $callerRefRule = null,
+                                         $matchRefRule = null, Zend_Db_Table_Select $select = null)
+    {
+        $db = $this->_getTable()->getAdapter();
+
+        if (is_string($intersectionTable)) {
+            $intersectionTable = $this->_getTableFromString($intersectionTable);
+        }
+
+        if (!$intersectionTable instanceof Zend_Db_Table_Abstract) {
+            $type = gettype($intersectionTable);
+            if ($type == 'object') {
+                $type = get_class($intersectionTable);
+            }
+            require_once 'Zend/Db/Table/Row/Exception.php';
+            throw new Zend_Db_Table_Row_Exception("Intersection table must be a Zend_Db_Table_Abstract, but it is $type");
+        }
+
+        // even if we are interacting between a table defined in a class and a
+        // table via extension, ensure to persist the definition
+        if (($tableDefinition = $this->_table->getDefinition()) !== null
+            && ($intersectionTable->getDefinition() == null)) {
+            $intersectionTable->setOptions(array(Zend_Db_Table_Abstract::DEFINITION => $tableDefinition));
+        }
+
+        if (is_string($matchTable)) {
+            $matchTable = $this->_getTableFromString($matchTable);
+        }
+
+        if (! $matchTable instanceof Zend_Db_Table_Abstract) {
+            $type = gettype($matchTable);
+            if ($type == 'object') {
+                $type = get_class($matchTable);
+            }
+            require_once 'Zend/Db/Table/Row/Exception.php';
+            throw new Zend_Db_Table_Row_Exception("Match table must be a Zend_Db_Table_Abstract, but it is $type");
+        }
+
+        // even if we are interacting between a table defined in a class and a
+        // table via extension, ensure to persist the definition
+        if (($tableDefinition = $this->_table->getDefinition()) !== null
+            && ($matchTable->getDefinition() == null)) {
+            $matchTable->setOptions(array(Zend_Db_Table_Abstract::DEFINITION => $tableDefinition));
+        }
+
+        if ($select === null) {
+            $select = $matchTable->select();
+        } else {
+            $select->setTable($matchTable);
+        }
+
+        // Use adapter from intersection table to ensure correct query construction
+        $interInfo = $intersectionTable->info();
+        $interDb   = $intersectionTable->getAdapter();
+        $interName = $interInfo['name'];
+        $interSchema = isset($interInfo['schema']) ? $interInfo['schema'] : null;
+        $matchInfo = $matchTable->info();
+        $matchName = $matchInfo['name'];
+        $matchSchema = isset($matchInfo['schema']) ? $matchInfo['schema'] : null;
+
+        $matchMap = $this->_prepareReference($intersectionTable, $matchTable, $matchRefRule);
+
+        for ($i = 0; $i < count($matchMap[Zend_Db_Table_Abstract::COLUMNS]); ++$i) {
+            $interCol = $interDb->quoteIdentifier('i' . '.' . $matchMap[Zend_Db_Table_Abstract::COLUMNS][$i], true);
+            $matchCol = $interDb->quoteIdentifier('m' . '.' . $matchMap[Zend_Db_Table_Abstract::REF_COLUMNS][$i], true);
+            $joinCond[] = "$interCol = $matchCol";
+        }
+        $joinCond = implode(' AND ', $joinCond);
+
+        $select->from(array('i' => $interName), array(), $interSchema)
+               ->joinInner(array('m' => $matchName), $joinCond, Zend_Db_Select::SQL_WILDCARD, $matchSchema)
+               ->setIntegrityCheck(false);
+
+        $callerMap = $this->_prepareReference($intersectionTable, $this->_getTable(), $callerRefRule);
+
+        for ($i = 0; $i < count($callerMap[Zend_Db_Table_Abstract::COLUMNS]); ++$i) {
+            $callerColumnName = $db->foldCase($callerMap[Zend_Db_Table_Abstract::REF_COLUMNS][$i]);
+            $value = $this->_data[$callerColumnName];
+            $interColumnName = $interDb->foldCase($callerMap[Zend_Db_Table_Abstract::COLUMNS][$i]);
+            $interCol = $interDb->quoteIdentifier("i.$interColumnName", true);
+            $interInfo = $intersectionTable->info();
+            $type = $interInfo[Zend_Db_Table_Abstract::METADATA][$interColumnName]['DATA_TYPE'];
+            $select->where($interDb->quoteInto("$interCol = ?", $value, $type));
+        }
+
+        $stmt = $select->query();
+
+        $config = array(
+            'table'    => $matchTable,
+            'data'     => $stmt->fetchAll(Zend_Db::FETCH_ASSOC),
+            'rowClass' => $matchTable->getRowClass(),
+            'readOnly' => false,
+            'stored'   => true
+        );
+
+        $rowsetClass = $matchTable->getRowsetClass();
+        if (!class_exists($rowsetClass)) {
+            try {
+                require_once 'Zend/Loader.php';
+                Zend_Loader::loadClass($rowsetClass);
+            } catch (Zend_Exception $e) {
+                require_once 'Zend/Db/Table/Row/Exception.php';
+                throw new Zend_Db_Table_Row_Exception($e->getMessage(), $e->getCode(), $e);
+            }
+        }
+        $rowset = new $rowsetClass($config);
+        return $rowset;
+    }
+
+    /**
+     * Turn magic function calls into non-magic function calls
+     * to the above methods.
+     *
+     * @param string $method
+     * @param array $args OPTIONAL Zend_Db_Table_Select query modifier
+     * @return Zend_Db_Table_Row_Abstract|Zend_Db_Table_Rowset_Abstract
+     * @throws Zend_Db_Table_Row_Exception If an invalid method is called.
+     */
+    public function __call($method, array $args)
+    {
+        $matches = array();
+
+        if (count($args) && $args[0] instanceof Zend_Db_Table_Select) {
+            $select = $args[0];
+        } else {
+            $select = null;
+        }
+
+        /**
+         * Recognize methods for Has-Many cases:
+         * findParent<Class>()
+         * findParent<Class>By<Rule>()
+         * Use the non-greedy pattern repeat modifier e.g. \w+?
+         */
+        if (preg_match('/^findParent(\w+?)(?:By(\w+))?$/', $method, $matches)) {
+            $class    = $matches[1];
+            $ruleKey1 = isset($matches[2]) ? $matches[2] : null;
+            return $this->findParentRow($class, $ruleKey1, $select);
+        }
+
+        /**
+         * Recognize methods for Many-to-Many cases:
+         * find<Class1>Via<Class2>()
+         * find<Class1>Via<Class2>By<Rule>()
+         * find<Class1>Via<Class2>By<Rule1>And<Rule2>()
+         * Use the non-greedy pattern repeat modifier e.g. \w+?
+         */
+        if (preg_match('/^find(\w+?)Via(\w+?)(?:By(\w+?)(?:And(\w+))?)?$/', $method, $matches)) {
+            $class    = $matches[1];
+            $viaClass = $matches[2];
+            $ruleKey1 = isset($matches[3]) ? $matches[3] : null;
+            $ruleKey2 = isset($matches[4]) ? $matches[4] : null;
+            return $this->findManyToManyRowset($class, $viaClass, $ruleKey1, $ruleKey2, $select);
+        }
+
+        /**
+         * Recognize methods for Belongs-To cases:
+         * find<Class>()
+         * find<Class>By<Rule>()
+         * Use the non-greedy pattern repeat modifier e.g. \w+?
+         */
+        if (preg_match('/^find(\w+?)(?:By(\w+))?$/', $method, $matches)) {
+            $class    = $matches[1];
+            $ruleKey1 = isset($matches[2]) ? $matches[2] : null;
+            return $this->findDependentRowset($class, $ruleKey1, $select);
+        }
+
+        require_once 'Zend/Db/Table/Row/Exception.php';
+        throw new Zend_Db_Table_Row_Exception("Unrecognized method '$method()'");
+    }
+
+
+    /**
+     * _getTableFromString
+     *
+     * @param string $tableName
+     * @return Zend_Db_Table_Abstract
+     */
+    protected function _getTableFromString($tableName)
+    {
+
+        if ($this->_table instanceof Zend_Db_Table_Abstract) {
+            $tableDefinition = $this->_table->getDefinition();
+
+            if ($tableDefinition !== null && $tableDefinition->hasTableConfig($tableName)) {
+                return new Zend_Db_Table($tableName, $tableDefinition);
+            }
+        }
+
+        // assume the tableName is the class name
+        if (!class_exists($tableName)) {
+            try {
+                require_once 'Zend/Loader.php';
+                Zend_Loader::loadClass($tableName);
+            } catch (Zend_Exception $e) {
+                require_once 'Zend/Db/Table/Row/Exception.php';
+                throw new Zend_Db_Table_Row_Exception($e->getMessage(), $e->getCode(), $e);
+            }
+        }
+
+        $options = array();
+
+        if (($table = $this->_getTable())) {
+            $options['db'] = $table->getAdapter();
+        }
+
+        if (isset($tableDefinition) && $tableDefinition !== null) {
+            $options[Zend_Db_Table_Abstract::DEFINITION] = $tableDefinition;
+        }
+
+        return new $tableName($options);
+    }
+
+}
+
+--------------------------------------https://searchcode.com/codesearch/view/108306540/--------------------------------------
+<?php
+/**
+ * Zend Framework
+ *
+ * LICENSE
+ *
+ * This source file is subject to the new BSD license that is bundled
+ * with this package in the file LICENSE.txt.
+ * It is also available through the world-wide-web at this URL:
+ * http://framework.zend.com/license/new-bsd
+ * If you did not receive a copy of the license and are unable to
+ * obtain it through the world-wide-web, please send an email
+ * to license@zend.com so we can send you a copy immediately.
+ *
+ * @category   Zend
+ * @package    Zend_Search_Lucene
+ * @subpackage Search
+ * @copyright  Copyright (c) 2005-2010 Zend Technologies USA Inc. (http://www.zend.com)
+ * @license    http://framework.zend.com/license/new-bsd     New BSD License
+ * @version    $Id$
+ */
+
+
+/** Internally used classes */
+
+/** Zend_Search_Lucene_Analysis_Analyzer */
+require_once 'Zend/Search/Lucene/Analysis/Analyzer.php';
+
+/** Zend_Search_Lucene_Search_QueryToken */
+require_once 'Zend/Search/Lucene/Search/QueryToken.php';
+
+
+
+/** Zend_Search_Lucene_FSM */
+require_once 'Zend/Search/Lucene/FSM.php';
+
+/**
+ * @category   Zend
+ * @package    Zend_Search_Lucene
+ * @subpackage Search
+ * @copyright  Copyright (c) 2005-2010 Zend Technologies USA Inc. (http://www.zend.com)
+ * @license    http://framework.zend.com/license/new-bsd     New BSD License
+ */
+class Zend_Search_Lucene_Search_QueryParser extends Zend_Search_Lucene_FSM
+{
+    /**
+     * Parser instance
+     *
+     * @var Zend_Search_Lucene_Search_QueryParser
+     */
+    private static $_instance = null;
+
+
+    /**
+     * Query lexer
+     *
+     * @var Zend_Search_Lucene_Search_QueryLexer
+     */
+    private $_lexer;
+
+    /**
+     * Tokens list
+     * Array of Zend_Search_Lucene_Search_QueryToken objects
+     *
+     * @var array
+     */
+    private $_tokens;
+
+    /**
+     * Current token
+     *
+     * @var integer|string
+     */
+    private $_currentToken;
+
+    /**
+     * Last token
+     *
+     * It can be processed within FSM states, but this addirional state simplifies FSM
+     *
+     * @var Zend_Search_Lucene_Search_QueryToken
+     */
+    private $_lastToken = null;
+
+    /**
+     * Range query first term
+     *
+     * @var string
+     */
+    private $_rqFirstTerm = null;
+
+    /**
+     * Current query parser context
+     *
+     * @var Zend_Search_Lucene_Search_QueryParserContext
+     */
+    private $_context;
+
+    /**
+     * Context stack
+     *
+     * @var array
+     */
+    private $_contextStack;
+
+    /**
+     * Query string encoding
+     *
+     * @var string
+     */
+    private $_encoding;
+
+    /**
+     * Query string default encoding
+     *
+     * @var string
+     */
+    private $_defaultEncoding = '';
+
+    /**
+     * Defines query parsing mode.
+     *
+     * If this option is turned on, then query parser suppress query parser exceptions
+     * and constructs multi-term query using all words from a query.
+     *
+     * That helps to avoid exceptions caused by queries, which don't conform to query language,
+     * but limits possibilities to check, that query entered by user has some inconsistencies.
+     *
+     *
+     * Default is true.
+     *
+     * Use {@link Zend_Search_Lucene::suppressQueryParsingExceptions()},
+     * {@link Zend_Search_Lucene::dontSuppressQueryParsingExceptions()} and
+     * {@link Zend_Search_Lucene::checkQueryParsingExceptionsSuppressMode()} to operate
+     * with this setting.
+     *
+     * @var boolean
+     */
+    private $_suppressQueryParsingExceptions = true;
+
+    /**
+     * Boolean operators constants
+     */
+    const B_OR  = 0;
+    const B_AND = 1;
+
+    /**
+     * Default boolean queries operator
+     *
+     * @var integer
+     */
+    private $_defaultOperator = self::B_OR;
+
+
+    /** Query parser State Machine states */
+    const ST_COMMON_QUERY_ELEMENT       = 0;   // Terms, phrases, operators
+    const ST_CLOSEDINT_RQ_START         = 1;   // Range query start (closed interval) - '['
+    const ST_CLOSEDINT_RQ_FIRST_TERM    = 2;   // First term in '[term1 to term2]' construction
+    const ST_CLOSEDINT_RQ_TO_TERM       = 3;   // 'TO' lexeme in '[term1 to term2]' construction
+    const ST_CLOSEDINT_RQ_LAST_TERM     = 4;   // Second term in '[term1 to term2]' construction
+    const ST_CLOSEDINT_RQ_END           = 5;   // Range query end (closed interval) - ']'
+    const ST_OPENEDINT_RQ_START         = 6;   // Range query start (opened interval) - '{'
+    const ST_OPENEDINT_RQ_FIRST_TERM    = 7;   // First term in '{term1 to term2}' construction
+    const ST_OPENEDINT_RQ_TO_TERM       = 8;   // 'TO' lexeme in '{term1 to term2}' construction
+    const ST_OPENEDINT_RQ_LAST_TERM     = 9;   // Second term in '{term1 to term2}' construction
+    const ST_OPENEDINT_RQ_END           = 10;  // Range query end (opened interval) - '}'
+
+    /**
+     * Parser constructor
+     */
+    public function __construct()
+    {
+        parent::__construct(array(self::ST_COMMON_QUERY_ELEMENT,
+                                  self::ST_CLOSEDINT_RQ_START,
+                                  self::ST_CLOSEDINT_RQ_FIRST_TERM,
+                                  self::ST_CLOSEDINT_RQ_TO_TERM,
+                                  self::ST_CLOSEDINT_RQ_LAST_TERM,
+                                  self::ST_CLOSEDINT_RQ_END,
+                                  self::ST_OPENEDINT_RQ_START,
+                                  self::ST_OPENEDINT_RQ_FIRST_TERM,
+                                  self::ST_OPENEDINT_RQ_TO_TERM,
+                                  self::ST_OPENEDINT_RQ_LAST_TERM,
+                                  self::ST_OPENEDINT_RQ_END
+                                 ),
+                            Zend_Search_Lucene_Search_QueryToken::getTypes());
+
+        $this->addRules(
+             array(array(self::ST_COMMON_QUERY_ELEMENT, Zend_Search_Lucene_Search_QueryToken::TT_WORD,             self::ST_COMMON_QUERY_ELEMENT),
+                   array(self::ST_COMMON_QUERY_ELEMENT, Zend_Search_Lucene_Search_QueryToken::TT_PHRASE,           self::ST_COMMON_QUERY_ELEMENT),
+                   array(self::ST_COMMON_QUERY_ELEMENT, Zend_Search_Lucene_Search_QueryToken::TT_FIELD,            self::ST_COMMON_QUERY_ELEMENT),
+                   array(self::ST_COMMON_QUERY_ELEMENT, Zend_Search_Lucene_Search_QueryToken::TT_REQUIRED,         self::ST_COMMON_QUERY_ELEMENT),
+                   array(self::ST_COMMON_QUERY_ELEMENT, Zend_Search_Lucene_Search_QueryToken::TT_PROHIBITED,       self::ST_COMMON_QUERY_ELEMENT),
+                   array(self::ST_COMMON_QUERY_ELEMENT, Zend_Search_Lucene_Search_QueryToken::TT_FUZZY_PROX_MARK,  self::ST_COMMON_QUERY_ELEMENT),
+                   array(self::ST_COMMON_QUERY_ELEMENT, Zend_Search_Lucene_Search_QueryToken::TT_BOOSTING_MARK,    self::ST_COMMON_QUERY_ELEMENT),
+                   array(self::ST_COMMON_QUERY_ELEMENT, Zend_Search_Lucene_Search_QueryToken::TT_RANGE_INCL_START, self::ST_CLOSEDINT_RQ_START),
+                   array(self::ST_COMMON_QUERY_ELEMENT, Zend_Search_Lucene_Search_QueryToken::TT_RANGE_EXCL_START, self::ST_OPENEDINT_RQ_START),
+                   array(self::ST_COMMON_QUERY_ELEMENT, Zend_Search_Lucene_Search_QueryToken::TT_SUBQUERY_START,   self::ST_COMMON_QUERY_ELEMENT),
+                   array(self::ST_COMMON_QUERY_ELEMENT, Zend_Search_Lucene_Search_QueryToken::TT_SUBQUERY_END,     self::ST_COMMON_QUERY_ELEMENT),
+                   array(self::ST_COMMON_QUERY_ELEMENT, Zend_Search_Lucene_Search_QueryToken::TT_AND_LEXEME,       self::ST_COMMON_QUERY_ELEMENT),
+                   array(self::ST_COMMON_QUERY_ELEMENT, Zend_Search_Lucene_Search_QueryToken::TT_OR_LEXEME,        self::ST_COMMON_QUERY_ELEMENT),
+                   array(self::ST_COMMON_QUERY_ELEMENT, Zend_Search_Lucene_Search_QueryToken::TT_NOT_LEXEME,       self::ST_COMMON_QUERY_ELEMENT),
+                   array(self::ST_COMMON_QUERY_ELEMENT, Zend_Search_Lucene_Search_QueryToken::TT_NUMBER,           self::ST_COMMON_QUERY_ELEMENT)
+                  ));
+        $this->addRules(
+             array(array(self::ST_CLOSEDINT_RQ_START,      Zend_Search_Lucene_Search_QueryToken::TT_WORD,           self::ST_CLOSEDINT_RQ_FIRST_TERM),
+                   array(self::ST_CLOSEDINT_RQ_FIRST_TERM, Zend_Search_Lucene_Search_QueryToken::TT_TO_LEXEME,      self::ST_CLOSEDINT_RQ_TO_TERM),
+                   array(self::ST_CLOSEDINT_RQ_TO_TERM,    Zend_Search_Lucene_Search_QueryToken::TT_WORD,           self::ST_CLOSEDINT_RQ_LAST_TERM),
+                   array(self::ST_CLOSEDINT_RQ_LAST_TERM,  Zend_Search_Lucene_Search_QueryToken::TT_RANGE_INCL_END, self::ST_COMMON_QUERY_ELEMENT)
+                  ));
+        $this->addRules(
+             array(array(self::ST_OPENEDINT_RQ_START,      Zend_Search_Lucene_Search_QueryToken::TT_WORD,           self::ST_OPENEDINT_RQ_FIRST_TERM),
+                   array(self::ST_OPENEDINT_RQ_FIRST_TERM, Zend_Search_Lucene_Search_QueryToken::TT_TO_LEXEME,      self::ST_OPENEDINT_RQ_TO_TERM),
+                   array(self::ST_OPENEDINT_RQ_TO_TERM,    Zend_Search_Lucene_Search_QueryToken::TT_WORD,           self::ST_OPENEDINT_RQ_LAST_TERM),
+                   array(self::ST_OPENEDINT_RQ_LAST_TERM,  Zend_Search_Lucene_Search_QueryToken::TT_RANGE_EXCL_END, self::ST_COMMON_QUERY_ELEMENT)
+                  ));
+
+
+
+        $addTermEntryAction             = new Zend_Search_Lucene_FSMAction($this, 'addTermEntry');
+        $addPhraseEntryAction           = new Zend_Search_Lucene_FSMAction($this, 'addPhraseEntry');
+        $setFieldAction                 = new Zend_Search_Lucene_FSMAction($this, 'setField');
+        $setSignAction                  = new Zend_Search_Lucene_FSMAction($this, 'setSign');
+        $setFuzzyProxAction             = new Zend_Search_Lucene_FSMAction($this, 'processFuzzyProximityModifier');
+        $processModifierParameterAction = new Zend_Search_Lucene_FSMAction($this, 'processModifierParameter');
+        $subqueryStartAction            = new Zend_Search_Lucene_FSMAction($this, 'subqueryStart');
+        $subqueryEndAction              = new Zend_Search_Lucene_FSMAction($this, 'subqueryEnd');
+        $logicalOperatorAction          = new Zend_Search_Lucene_FSMAction($this, 'logicalOperator');
+        $openedRQFirstTermAction        = new Zend_Search_Lucene_FSMAction($this, 'openedRQFirstTerm');
+        $openedRQLastTermAction         = new Zend_Search_Lucene_FSMAction($this, 'openedRQLastTerm');
+        $closedRQFirstTermAction        = new Zend_Search_Lucene_FSMAction($this, 'closedRQFirstTerm');
+        $closedRQLastTermAction         = new Zend_Search_Lucene_FSMAction($this, 'closedRQLastTerm');
+
+
+        $this->addInputAction(self::ST_COMMON_QUERY_ELEMENT, Zend_Search_Lucene_Search_QueryToken::TT_WORD,            $addTermEntryAction);
+        $this->addInputAction(self::ST_COMMON_QUERY_ELEMENT, Zend_Search_Lucene_Search_QueryToken::TT_PHRASE,          $addPhraseEntryAction);
+        $this->addInputAction(self::ST_COMMON_QUERY_ELEMENT, Zend_Search_Lucene_Search_QueryToken::TT_FIELD,           $setFieldAction);
+        $this->addInputAction(self::ST_COMMON_QUERY_ELEMENT, Zend_Search_Lucene_Search_QueryToken::TT_REQUIRED,        $setSignAction);
+        $this->addInputAction(self::ST_COMMON_QUERY_ELEMENT, Zend_Search_Lucene_Search_QueryToken::TT_PROHIBITED,      $setSignAction);
+        $this->addInputAction(self::ST_COMMON_QUERY_ELEMENT, Zend_Search_Lucene_Search_QueryToken::TT_FUZZY_PROX_MARK, $setFuzzyProxAction);
+        $this->addInputAction(self::ST_COMMON_QUERY_ELEMENT, Zend_Search_Lucene_Search_QueryToken::TT_NUMBER,          $processModifierParameterAction);
+        $this->addInputAction(self::ST_COMMON_QUERY_ELEMENT, Zend_Search_Lucene_Search_QueryToken::TT_SUBQUERY_START,  $subqueryStartAction);
+        $this->addInputAction(self::ST_COMMON_QUERY_ELEMENT, Zend_Search_Lucene_Search_QueryToken::TT_SUBQUERY_END,    $subqueryEndAction);
+        $this->addInputAction(self::ST_COMMON_QUERY_ELEMENT, Zend_Search_Lucene_Search_QueryToken::TT_AND_LEXEME,      $logicalOperatorAction);
+        $this->addInputAction(self::ST_COMMON_QUERY_ELEMENT, Zend_Search_Lucene_Search_QueryToken::TT_OR_LEXEME,       $logicalOperatorAction);
+        $this->addInputAction(self::ST_COMMON_QUERY_ELEMENT, Zend_Search_Lucene_Search_QueryToken::TT_NOT_LEXEME,      $logicalOperatorAction);
+
+        $this->addEntryAction(self::ST_OPENEDINT_RQ_FIRST_TERM, $openedRQFirstTermAction);
+        $this->addEntryAction(self::ST_OPENEDINT_RQ_LAST_TERM,  $openedRQLastTermAction);
+        $this->addEntryAction(self::ST_CLOSEDINT_RQ_FIRST_TERM, $closedRQFirstTermAction);
+        $this->addEntryAction(self::ST_CLOSEDINT_RQ_LAST_TERM,  $closedRQLastTermAction);
+
+
+        require_once 'Zend/Search/Lucene/Search/QueryLexer.php';
+        $this->_lexer = new Zend_Search_Lucene_Search_QueryLexer();
+    }
+
+    /**
+     * Get query parser instance
+     *
+     * @return Zend_Search_Lucene_Search_QueryParser
+     */
+    private static function _getInstance()
+    {
+        if (self::$_instance === null) {
+            self::$_instance = new self();
+        }
+        return self::$_instance;
+    }
+
+    /**
+     * Set query string default encoding
+     *
+     * @param string $encoding
+     */
+    public static function setDefaultEncoding($encoding)
+    {
+        self::_getInstance()->_defaultEncoding = $encoding;
+    }
+
+    /**
+     * Get query string default encoding
+     *
+     * @return string
+     */
+    public static function getDefaultEncoding()
+    {
+       return self::_getInstance()->_defaultEncoding;
+    }
+
+    /**
+     * Set default boolean operator
+     *
+     * @param integer $operator
+     */
+    public static function setDefaultOperator($operator)
+    {
+        self::_getInstance()->_defaultOperator = $operator;
+    }
+
+    /**
+     * Get default boolean operator
+     *
+     * @return integer
+     */
+    public static function getDefaultOperator()
+    {
+        return self::_getInstance()->_defaultOperator;
+    }
+
+    /**
+     * Turn on 'suppress query parser exceptions' mode.
+     */
+    public static function suppressQueryParsingExceptions()
+    {
+        self::_getInstance()->_suppressQueryParsingExceptions = true;
+    }
+    /**
+     * Turn off 'suppress query parser exceptions' mode.
+     */
+    public static function dontSuppressQueryParsingExceptions()
+    {
+        self::_getInstance()->_suppressQueryParsingExceptions = false;
+    }
+    /**
+     * Check 'suppress query parser exceptions' mode.
+     * @return boolean
+     */
+    public static function queryParsingExceptionsSuppressed()
+    {
+        return self::_getInstance()->_suppressQueryParsingExceptions;
+    }
+
+
+
+    /**
+     * Parses a query string
+     *
+     * @param string $strQuery
+     * @param string $encoding
+     * @return Zend_Search_Lucene_Search_Query
+     * @throws Zend_Search_Lucene_Search_QueryParserException
+     */
+    public static function parse($strQuery, $encoding = null)
+    {
+        self::_getInstance();
+
+        // Reset FSM if previous parse operation didn't return it into a correct state
+        self::$_instance->reset();
+
+        require_once 'Zend/Search/Lucene/Search/QueryParserException.php';
+        try {
+            require_once 'Zend/Search/Lucene/Search/QueryParserContext.php';
+
+            self::$_instance->_encoding     = ($encoding !== null) ? $encoding : self::$_instance->_defaultEncoding;
+            self::$_instance->_lastToken    = null;
+            self::$_instance->_context      = new Zend_Search_Lucene_Search_QueryParserContext(self::$_instance->_encoding);
+            self::$_instance->_contextStack = array();
+            self::$_instance->_tokens       = self::$_instance->_lexer->tokenize($strQuery, self::$_instance->_encoding);
+
+            // Empty query
+            if (count(self::$_instance->_tokens) == 0) {
+                require_once 'Zend/Search/Lucene/Search/Query/Insignificant.php';
+                return new Zend_Search_Lucene_Search_Query_Insignificant();
+            }
+
+
+            foreach (self::$_instance->_tokens as $token) {
+                try {
+                    self::$_instance->_currentToken = $token;
+                    self::$_instance->process($token->type);
+
+                    self::$_instance->_lastToken = $token;
+                } catch (Exception $e) {
+                    if (strpos($e->getMessage(), 'There is no any rule for') !== false) {
+                        throw new Zend_Search_Lucene_Search_QueryParserException( 'Syntax error at char position ' . $token->position . '.', 0, $e);
+                    }
+
+                    require_once 'Zend/Search/Lucene/Exception.php';
+                    throw new Zend_Search_Lucene_Exception($e->getMessage(), $e->getCode(), $e);
+                }
+            }
+
+            if (count(self::$_instance->_contextStack) != 0) {
+                throw new Zend_Search_Lucene_Search_QueryParserException('Syntax Error: mismatched parentheses, every opening must have closing.' );
+            }
+
+            return self::$_instance->_context->getQuery();
+        } catch (Zend_Search_Lucene_Search_QueryParserException $e) {
+            if (self::$_instance->_suppressQueryParsingExceptions) {
+                $queryTokens = Zend_Search_Lucene_Analysis_Analyzer::getDefault()->tokenize($strQuery, self::$_instance->_encoding);
+
+                require_once 'Zend/Search/Lucene/Search/Query/MultiTerm.php';
+                $query = new Zend_Search_Lucene_Search_Query_MultiTerm();
+                $termsSign = (self::$_instance->_defaultOperator == self::B_AND) ? true /* required term */ :
+                                                                                   null /* optional term */;
+
+                require_once 'Zend/Search/Lucene/Index/Term.php';
+                foreach ($queryTokens as $token) {
+                    $query->addTerm(new Zend_Search_Lucene_Index_Term($token->getTermText()), $termsSign);
+                }
+
+
+                return $query;
+            } else {
+                require_once 'Zend/Search/Lucene/Exception.php';
+                throw new Zend_Search_Lucene_Exception($e->getMessage(), $e->getCode(), $e);
+            }
+        }
+    }
+
+    /*********************************************************************
+     * Actions implementation
+     *
+     * Actions affect on recognized lexemes list
+     *********************************************************************/
+
+    /**
+     * Add term to a query
+     */
+    public function addTermEntry()
+    {
+        require_once 'Zend/Search/Lucene/Search/QueryEntry/Term.php';
+        $entry = new Zend_Search_Lucene_Search_QueryEntry_Term($this->_currentToken->text, $this->_context->getField());
+        $this->_context->addEntry($entry);
+    }
+
+    /**
+     * Add phrase to a query
+     */
+    public function addPhraseEntry()
+    {
+        require_once 'Zend/Search/Lucene/Search/QueryEntry/Phrase.php';
+        $entry = new Zend_Search_Lucene_Search_QueryEntry_Phrase($this->_currentToken->text, $this->_context->getField());
+        $this->_context->addEntry($entry);
+    }
+
+    /**
+     * Set entry field
+     */
+    public function setField()
+    {
+        $this->_context->setNextEntryField($this->_currentToken->text);
+    }
+
+    /**
+     * Set entry sign
+     */
+    public function setSign()
+    {
+        $this->_context->setNextEntrySign($this->_currentToken->type);
+    }
+
+
+    /**
+     * Process fuzzy search/proximity modifier - '~'
+     */
+    public function processFuzzyProximityModifier()
+    {
+        $this->_context->processFuzzyProximityModifier();
+    }
+
+    /**
+     * Process modifier parameter
+     *
+     * @throws Zend_Search_Lucene_Exception
+     */
+    public function processModifierParameter()
+    {
+        if ($this->_lastToken === null) {
+            require_once 'Zend/Search/Lucene/Search/QueryParserException.php';
+            throw new Zend_Search_Lucene_Search_QueryParserException('Lexeme modifier parameter must follow lexeme modifier. Char position 0.' );
+        }
+
+        switch ($this->_lastToken->type) {
+            case Zend_Search_Lucene_Search_QueryToken::TT_FUZZY_PROX_MARK:
+                $this->_context->processFuzzyProximityModifier($this->_currentToken->text);
+                break;
+
+            case Zend_Search_Lucene_Search_QueryToken::TT_BOOSTING_MARK:
+                $this->_context->boost($this->_currentToken->text);
+                break;
+
+            default:
+                // It's not a user input exception
+                require_once 'Zend/Search/Lucene/Exception.php';
+                throw new Zend_Search_Lucene_Exception('Lexeme modifier parameter must follow lexeme modifier. Char position 0.' );
+        }
+    }
+
+
+    /**
+     * Start subquery
+     */
+    public function subqueryStart()
+    {
+        require_once 'Zend/Search/Lucene/Search/QueryParserContext.php';
+
+        $this->_contextStack[] = $this->_context;
+        $this->_context        = new Zend_Search_Lucene_Search_QueryParserContext($this->_encoding, $this->_context->getField());
+    }
+
+    /**
+     * End subquery
+     */
+    public function subqueryEnd()
+    {
+        if (count($this->_contextStack) == 0) {
+            require_once 'Zend/Search/Lucene/Search/QueryParserException.php';
+            throw new Zend_Search_Lucene_Search_QueryParserException('Syntax Error: mismatched parentheses, every opening must have closing. Char position ' . $this->_currentToken->position . '.' );
+        }
+
+        $query          = $this->_context->getQuery();
+        $this->_context = array_pop($this->_contextStack);
+
+        require_once 'Zend/Search/Lucene/Search/QueryEntry/Subquery.php';
+        $this->_context->addEntry(new Zend_Search_Lucene_Search_QueryEntry_Subquery($query));
+    }
+
+    /**
+     * Process logical operator
+     */
+    public function logicalOperator()
+    {
+        $this->_context->addLogicalOperator($this->_currentToken->type);
+    }
+
+    /**
+     * Process first range query term (opened interval)
+     */
+    public function openedRQFirstTerm()
+    {
+        $this->_rqFirstTerm = $this->_currentToken->text;
+    }
+
+    /**
+     * Process last range query term (opened interval)
+     *
+     * @throws Zend_Search_Lucene_Search_QueryParserException
+     */
+    public function openedRQLastTerm()
+    {
+        $tokens = Zend_Search_Lucene_Analysis_Analyzer::getDefault()->tokenize($this->_rqFirstTerm, $this->_encoding);
+        if (count($tokens) > 1) {
+            require_once 'Zend/Search/Lucene/Search/QueryParserException.php';
+            throw new Zend_Search_Lucene_Search_QueryParserException('Range query boundary terms must be non-multiple word terms');
+        } else if (count($tokens) == 1) {
+            require_once 'Zend/Search/Lucene/Index/Term.php';
+            $from = new Zend_Search_Lucene_Index_Term(reset($tokens)->getTermText(), $this->_context->getField());
+        } else {
+            $from = null;
+        }
+
+        $tokens = Zend_Search_Lucene_Analysis_Analyzer::getDefault()->tokenize($this->_currentToken->text, $this->_encoding);
+        if (count($tokens) > 1) {
+            require_once 'Zend/Search/Lucene/Search/QueryParserException.php';
+            throw new Zend_Search_Lucene_Search_QueryParserException('Range query boundary terms must be non-multiple word terms');
+        } else if (count($tokens) == 1) {
+            require_once 'Zend/Search/Lucene/Index/Term.php';
+            $to = new Zend_Search_Lucene_Index_Term(reset($tokens)->getTermText(), $this->_context->getField());
+        } else {
+            $to = null;
+        }
+
+        if ($from === null  &&  $to === null) {
+            require_once 'Zend/Search/Lucene/Search/QueryParserException.php';
+            throw new Zend_Search_Lucene_Search_QueryParserException('At least one range query boundary term must be non-empty term');
+        }
+
+        require_once 'Zend/Search/Lucene/Search/Query/Range.php';
+        $rangeQuery = new Zend_Search_Lucene_Search_Query_Range($from, $to, false);
+        require_once 'Zend/Search/Lucene/Search/QueryEntry/Subquery.php';
+        $entry      = new Zend_Search_Lucene_Search_QueryEntry_Subquery($rangeQuery);
+        $this->_context->addEntry($entry);
+    }
+
+    /**
+     * Process first range query term (closed interval)
+     */
+    public function closedRQFirstTerm()
+    {
+        $this->_rqFirstTerm = $this->_currentToken->text;
+    }
+
+    /**
+     * Process last range query term (closed interval)
+     *
+     * @throws Zend_Search_Lucene_Search_QueryParserException
+     */
+    public function closedRQLastTerm()
+    {
+        $tokens = Zend_Search_Lucene_Analysis_Analyzer::getDefault()->tokenize($this->_rqFirstTerm, $this->_encoding);
+        if (count($tokens) > 1) {
+            require_once 'Zend/Search/Lucene/Search/QueryParserException.php';
+            throw new Zend_Search_Lucene_Search_QueryParserException('Range query boundary terms must be non-multiple word terms');
+        } else if (count($tokens) == 1) {
+            require_once 'Zend/Search/Lucene/Index/Term.php';
+            $from = new Zend_Search_Lucene_Index_Term(reset($tokens)->getTermText(), $this->_context->getField());
+        } else {
+            $from = null;
+        }
+
+        $tokens = Zend_Search_Lucene_Analysis_Analyzer::getDefault()->tokenize($this->_currentToken->text, $this->_encoding);
+        if (count($tokens) > 1) {
+            require_once 'Zend/Search/Lucene/Search/QueryParserException.php';
+            throw new Zend_Search_Lucene_Search_QueryParserException('Range query boundary terms must be non-multiple word terms');
+        } else if (count($tokens) == 1) {
+            require_once 'Zend/Search/Lucene/Index/Term.php';
+            $to = new Zend_Search_Lucene_Index_Term(reset($tokens)->getTermText(), $this->_context->getField());
+        } else {
+            $to = null;
+        }
+
+        if ($from === null  &&  $to === null) {
+            require_once 'Zend/Search/Lucene/Search/QueryParserException.php';
+            throw new Zend_Search_Lucene_Search_QueryParserException('At least one range query boundary term must be non-empty term');
+        }
+
+        require_once 'Zend/Search/Lucene/Search/Query/Range.php';
+        $rangeQuery = new Zend_Search_Lucene_Search_Query_Range($from, $to, true);
+        require_once 'Zend/Search/Lucene/Search/QueryEntry/Subquery.php';
+        $entry      = new Zend_Search_Lucene_Search_QueryEntry_Subquery($rangeQuery);
+        $this->_context->addEntry($entry);
+    }
+}
+
+
