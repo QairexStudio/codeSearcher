@@ -7,6 +7,8 @@ look at the commands:
 vulnerability scanning:
 > python3 sc.py '$_GET'
 
+# Build
+**Since the requests module is used, install the current requests module.**
 # Future features
 - [ ] Updater
 - [ ] new commands, visual effects, easy usability and fix issues
